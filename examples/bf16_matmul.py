@@ -53,7 +53,7 @@ def matmul(x, y, out_row_tile_size, out_col_tile_size, reduction_tile_size, num_
 
     # Ensure we are adhering to Hopper tile constraints
     if out_row_tile_size % 64 or out_col_tile_size % 8:
-        raise("Output tile sizes should be evenly divisible by 64 and 8 respectively!")
+        raise ValueError("Output tile sizes should be evenly divisible by 64 and 8 respectively!")
 
     bytes_per_elem = 2  # bf16 consumes 2 bytes
     num_warpgroup_threads = 128
@@ -74,7 +74,7 @@ def matmul(x, y, out_row_tile_size, out_col_tile_size, reduction_tile_size, num_
     )
 
     # Bytes consumed by one pipeline:(m * k + n*k) * 2
-    input_smem_bytes = num_pipeline_stages * reduction_tile_size * (out_row_tile_size * out_col_tile_size) * bytes_per_elem
+    input_smem_bytes = num_pipeline_stages * reduction_tile_size * (out_row_tile_size + out_col_tile_size) * bytes_per_elem
     out_smem_bytes = out_row_tile_size * out_col_tile_size * bytes_per_elem
 
     # Total registers per thread
@@ -98,7 +98,7 @@ def matmul(x, y, out_row_tile_size, out_col_tile_size, reduction_tile_size, num_
             local_tile_idx = tile_idx % col_group_span
 
             # Find the first column (the start) and width of the active column group
-            active_col_group_start = col_group_idx % col_group_size
+            active_col_group_start = col_group_idx * col_group_size
             active_col_group_stride = jnp.minimum(num_out_col_tiles - active_col_group_start, col_group_size)
 
             # Convert linear tile index to 2D (row, column) format
@@ -134,7 +134,7 @@ def matmul(x, y, out_row_tile_size, out_col_tile_size, reduction_tile_size, num_
             # Zero initialize the accumulator for the output tile
             acc = pl.run_scoped(
                 accumulate_over_reduction_dim,
-                plgpu.ACC((out_row_tile_size, out_col_tile_size)), jnp.float32
+                plgpu.ACC((out_row_tile_size, out_col_tile_size), jnp.float32)
             )
 
             # Once the reduction is complete, we need to write the results to the output shared memory
