@@ -11,6 +11,8 @@ from jax.extend import backend
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from utils import get_max_smem_bytes
+
 
 def matmul(
     lhs,
@@ -45,7 +47,9 @@ def matmul(
     if lhs.dtype != jnp.bfloat16 or rhs.dtype != jnp.bfloat16:
         raise ValueError("Inputs must be of dtype `jnp.bfloat16`")
     if k != k_rhs:
-        raise ValueError(f"Reduction dimension must match. Got {k} for LHS and {k_rhs} for RHS")
+        raise ValueError(
+            f"Reduction dimension must match. Got {k} for LHS and {k_rhs} for RHS"
+        )
 
     if (
         tile_m <= 0
@@ -54,15 +58,20 @@ def matmul(
         or num_pipeline_stages <= 0
         or panel_width <= 0
     ):
-        raise ValueError("Tile dimensions, pipeline stages, and panel width must be positive!")
+        raise ValueError(
+            "Tile dimensions, pipeline stages, and panel width must be positive!"
+        )
 
     if m % tile_m or n % tile_n or k % tile_k:
-        raise ValueError("Tile sizes must evenly divide the corresponding input matrix dimensions (M, N, K)")
+        raise ValueError(
+            "Tile sizes must evenly divide the corresponding input matrix dimensions (M, N, K)"
+        )
 
     # Adhere to Hopper WGMMA tile alignment constraints
     if tile_m % 64 or tile_n % 8:
-        raise ValueError("Output tile sizes (tile_m, tile_n) must be multiples of 64 and 8 respectively!")
-
+        raise ValueError(
+            "Output tile sizes (tile_m, tile_n) must be multiples of 64 and 8 respectively!"
+        )
 
     bytes_per_elem = 2  # bf16 consumes 2 bytes
     num_warpgroup_threads = 128
@@ -80,15 +89,19 @@ def matmul(
     # Shared Memory (SMEM) allocation sizing
     input_smem_bytes = num_pipeline_stages * tile_k * (tile_m + tile_n) * bytes_per_elem
     out_smem_bytes = tile_m * tile_n * bytes_per_elem
+    max_smem_bytes = get_max_smem_bytes()
 
     # Register allocation sizing per thread
     acc_reg_per_thread = tile_m * tile_n // num_warpgroup_threads
 
-    if input_smem_bytes + out_smem_bytes > get_max_smem_bytes():
-        raise ValueError("The current configuration exceeds the total available shared memory!")
+    if max_smem_bytes is None:
+        raise ValueError("Unable to find out max shared memory size for this GPU!")
+    if input_smem_bytes + out_smem_bytes > max_smem_bytes:
+        raise ValueError(
+            "The current configuration exceeds the total available shared memory!"
+        )
     if acc_reg_per_thread > 192:  # Hardware ceiling for Hopper H100/H200
         raise ValueError("The accumulator leaves too few registers!")
-
 
     def kernel(lhs_gmem, rhs_gmem, out_gmem, out_smem):
         def compute_one_output_tile(tile_idx):
@@ -105,7 +118,9 @@ def matmul(
 
             # Identify panel boundary and clamped width (handles edge tiles)
             panel_start_col = panel_idx * panel_width
-            effective_panel_width = jnp.minimum(num_tiles_n - panel_start_col, panel_width)
+            effective_panel_width = jnp.minimum(
+                num_tiles_n - panel_start_col, panel_width
+            )
 
             # Determine local 2D coordinate inside the active panel
             row_idx = tile_in_panel_idx // effective_panel_width
@@ -119,16 +134,21 @@ def matmul(
             )
             col_idx = panel_start_col + col_offset
 
-
             def accumulate_over_reduction_dim(acc):
                 def pipeline_step(_, lhs_smem, rhs_smem):
                     # Tensor Core MMA: acc += lhs_tile @ rhs_tile
                     plgpu.wgmma(acc, lhs_smem, rhs_smem)
                     plgpu.wgmma_wait(1)
 
-                tile_spec = partial(plgpu.BlockSpec, transforms=input_transforms, delay_release=1)
-                lhs_tile_spec = tile_spec((tile_m, tile_k), lambda k_idx: (row_idx, k_idx))
-                rhs_tile_spec = tile_spec((tile_k, tile_n), lambda k_idx: (k_idx, col_idx))
+                tile_spec = partial(
+                    plgpu.BlockSpec, transforms=input_transforms, delay_release=1
+                )
+                lhs_tile_spec = tile_spec(
+                    (tile_m, tile_k), lambda k_idx: (row_idx, k_idx)
+                )
+                rhs_tile_spec = tile_spec(
+                    (tile_k, tile_n), lambda k_idx: (k_idx, col_idx)
+                )
 
                 # Asynchronous SMEM staged pipeline
                 plgpu.emit_pipeline(
@@ -141,7 +161,9 @@ def matmul(
                 return acc[...]
 
             # Run reduction in accumulator registers (float32 precision)
-            acc = pl.run_scoped(accumulate_over_reduction_dim, plgpu.ACC((tile_m, tile_n), jnp.float32))
+            acc = pl.run_scoped(
+                accumulate_over_reduction_dim, plgpu.ACC((tile_m, tile_n), jnp.float32)
+            )
 
             # Cast accumulator to bf16 in SMEM and commit
             out_smem[...] = acc[...].astype(jnp.bfloat16)
@@ -153,9 +175,9 @@ def matmul(
             plgpu.copy_smem_to_gmem(out_smem, out_gmem.at[m_slice, n_slice])
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
-
         # Grid Dispatch: Persistent Worker Loop vs. 1-to-1 Threadblock Launch
         if is_persistent:
+
             def persistent_loop_body(loop_info):
                 (tile_idx,) = loop_info.index
                 compute_one_output_tile(tile_idx)
@@ -186,8 +208,11 @@ def matmul(
         grid=launch_grid,
         grid_names=grid_names,
         kernel_name="hopper_bf16_matmul",
-        compiler_params=plgpu.CompilerParams(approx_math=True, unsafe_no_auto_barriers=True),
+        compiler_params=plgpu.CompilerParams(
+            approx_math=True, unsafe_no_auto_barriers=True
+        ),
     )(lhs, rhs)
+
 
 def main(args):
     key = jax.random.PRNGKey(0)
@@ -197,13 +222,14 @@ def main(args):
     rhs = jax.random.normal(shape=(args.k, args.n), key=rhs_key, dtype=jnp.bfloat16)
 
     out1 = matmul(
-        lhs, rhs,
+        lhs,
+        rhs,
         tile_m=args.tile_m,
         tile_k=args.tile_k,
         tile_n=args.tile_n,
         num_pipeline_stages=args.num_pipeline_stages,
         panel_width=args.panel_width,
-        is_persistent=args.is_persistent
+        is_persistent=args.is_persistent,
     )
 
     out2 = jnp.matmul(lhs, rhs)
