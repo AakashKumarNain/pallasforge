@@ -186,7 +186,42 @@ def matmul(
         grid=launch_grid,
         grid_names=grid_names,
         kernel_name="hopper_bf16_matmul",
-        compiler_params=plgpu.CompilerParams(
-            approx_math=True, unsafe_no_auto_barriers=True
-        ),
+        compiler_params=plgpu.CompilerParams(approx_math=True, unsafe_no_auto_barriers=True),
     )(lhs, rhs)
+
+def main(args):
+    key = jax.random.PRNGKey(0)
+    key, lhs_key, rhs_key = jax.random.split(key, 3)
+
+    lhs = jax.random.normal(shape=(args.m, args.k), key=lhs_key, dtype=jnp.bfloat16)
+    rhs = jax.random.normal(shape=(args.k, args.n), key=rhs_key, dtype=jnp.bfloat16)
+
+    out1 = matmul(
+        lhs, rhs,
+        tile_m=args.tile_m,
+        tile_k=args.tile_k,
+        tile_n=args.tile_n,
+        num_pipeline_stages=args.num_pipeline_stages,
+        panel_width=args.panel_width,
+        is_persistent=args.is_persistent
+    )
+
+    out2 = jnp.matmul(lhs, rhs)
+    print("Checking correctness ... ", end=" ")
+    print(jnp.allclose(out1, out2, atol=1e-2, rtol=1e-2))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Arguments for bf16 matmul kernel")
+    parser.add_argument("-m", default=64, type=int)
+    parser.add_argument("-k", default=4096, type=int)
+    parser.add_argument("-n", default=4096, type=int)
+    parser.add_argument("--tile_m", required=True, default=64, type=int)
+    parser.add_argument("--tile_n", required=True, default=128, type=int)
+    parser.add_argument("--tile_k", required=True, default=128, type=int)
+    parser.add_argument("--num_pipeline_stages", default=4, type=int)
+    parser.add_argument("--panel_width", default=4, type=int)
+    parser.add_argument("--is_persistent", default=True, type=bool)
+
+    arguments = parser.parse_args()
+    main(arguments)
