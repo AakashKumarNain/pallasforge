@@ -160,7 +160,7 @@ def matmul(
                 (tile_idx,) = loop_info.index
                 compute_one_output_tile(tile_idx)
 
-            plgpu.nd_loop((total_tiles_mn,), collective_axes="sm")(persistent_loop_bod)
+            plgpu.nd_loop((total_tiles_mn,), collective_axes="sm")(persistent_loop_body)
         else:
             tile_idx = jax.lax.axis_index("out_tile")
             compute_one_output_tile(tile_idx)
@@ -216,9 +216,9 @@ if __name__ == "__main__":
     parser.add_argument("-m", default=64, type=int)
     parser.add_argument("-k", default=4096, type=int)
     parser.add_argument("-n", default=4096, type=int)
-    parser.add_argument("--tile_m", required=True, default=64, type=int)
-    parser.add_argument("--tile_n", required=True, default=128, type=int)
-    parser.add_argument("--tile_k", required=True, default=128, type=int)
+    parser.add_argument("--tile_m", default=64, type=int)
+    parser.add_argument("--tile_n", default=128, type=int)
+    parser.add_argument("--tile_k", default=128, type=int)
     parser.add_argument("--num_pipeline_stages", default=4, type=int)
     parser.add_argument("--panel_width", default=4, type=int)
     parser.add_argument("--is_persistent", default=True, type=bool)
