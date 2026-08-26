@@ -13,8 +13,15 @@ class BenchmarkReport:
     cupti_times_ms: list[float]
 
     @property
-    def median_kernel_time_ms(self) -> float:
+    def median_kernel_time_ms(self):
         return float(jnp.median(jnp.array(self.cupti_times_ms)))
+
+    @property
+    def print_benchmarks(self):
+        print(f"lowering time : {self.lower_time_ms:.3f} ms")
+        print(f"compile time  : {self.compile_time_ms:.3f} ms")
+        print(f"kernel time   : {self.median_kernel_time_ms():.3f} ms")
+        print(f"memory usage  : {self.peak_memory_mb:.2f} MB")
 
 
 def get_max_smem_bytes():
@@ -57,15 +64,13 @@ def get_lowering_time(jitted_fn, inputs):
     return lowered, duration_ms
 
 
-def benchmark_cupti_runtime(jitted_fn, inputs, warmup_iteratons=5, iteraions=10):
+def benchmark_cupti_runtime(jitted_fn, inputs, warmup_iteratons=5, iterations=10):
     for _ in range(warmup_iteratons):
         jitted_fn(inputs).block_until_ready()
 
     timings = []
-    for _ in range(iteraions):
-        res, duration_ms = profiler.measure(jitted_fn, mode="cupti", finalize=False)(
-            *inputs
-        )
+    for _ in range(iterations):
+        res, duration_ms = profiler.Cupti(finalize=False)(jitted_fn)(*inputs)
         res.block_until_ready()
         timings.append(duration_ms)
     return timings
@@ -94,7 +99,7 @@ def benchmark(jitted_fn, inputs, warmup_iterations=5, iterations=100):
     compiled_fn, compiled_time = get_compile_time(lowered_fn)
     memory_usage = get_memory_usage(compiled_fn)
     kernel_time = benchmark_cupti_runtime(
-        jitted_fn, inputs, warmup_iteratons=warmup_iterations, iteraions=iterations
+        jitted_fn, inputs, warmup_iteratons=warmup_iterations, iterations=iterations
     )
     return BenchmarkReport(
         compile_time_ms=compiled_time,
