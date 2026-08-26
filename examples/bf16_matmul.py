@@ -143,12 +143,8 @@ def matmul(
                 tile_spec = partial(
                     plgpu.BlockSpec, transforms=input_transforms, delay_release=1
                 )
-                lhs_tile_spec = tile_spec(
-                    (tile_m, tile_k), lambda k_idx: (row_idx, k_idx)
-                )
-                rhs_tile_spec = tile_spec(
-                    (tile_k, tile_n), lambda k_idx: (k_idx, col_idx)
-                )
+                lhs_tile_spec = tile_spec((tile_m, tile_k), lambda k_idx: (row_idx, k_idx))  # fmt: skip
+                rhs_tile_spec = tile_spec((tile_k, tile_n), lambda k_idx: (k_idx, col_idx))  # fmt: skip
 
                 # Asynchronous SMEM staged pipeline
                 plgpu.emit_pipeline(
