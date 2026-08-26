@@ -20,7 +20,7 @@ class BenchmarkReport:
     def print_benchmarks(self):
         print(f"lowering time : {self.lower_time_ms:.3f} ms")
         print(f"compile time  : {self.compile_time_ms:.3f} ms")
-        print(f"kernel time   : {self.median_kernel_time_ms():.3f} ms")
+        print(f"kernel time   : {self.median_kernel_time_ms:.3f} ms")
         print(f"memory usage  : {self.peak_memory_mb:.2f} MB")
 
 
@@ -66,11 +66,12 @@ def get_lowering_time(jitted_fn, inputs):
 
 def benchmark_cupti_runtime(jitted_fn, inputs, warmup_iteratons=5, iterations=10):
     for _ in range(warmup_iteratons):
-        jitted_fn(inputs).block_until_ready()
+        jitted_fn(*inputs).block_until_ready()
 
     timings = []
+    runner = profiler.Cupti(finalize=False).measure(jitted_fn)
     for _ in range(iterations):
-        res, duration_ms = profiler.Cupti(finalize=False)(jitted_fn)(*inputs)
+        res, duration_ms = runner(*inputs)
         res.block_until_ready()
         timings.append(duration_ms)
     return timings
