@@ -34,7 +34,6 @@ class BenchmarkReport:
 
     def print_summary(self):
         """Prints a formatted summary of the benchmark metrics."""
-        print("=== Benchmark Report ===")
         print(f"Lowering Time       :  {self.lower_time_ms:.3f} ms")
         print(f"Compilation Time    :  {self.compile_time_ms:.3f} ms")
         print(f"Peak Device Memory  :  {self.peak_memory_mb:.2f} MB")
@@ -123,14 +122,14 @@ def benchmark(
 
     # 5. Warmup executions (lowered handles dynamic/static dispatch internally)
     for _ in range(warmup):
-        lowered(*args, **kwargs).block_until_ready()
+        compiled(*args).block_until_ready()
 
     # 6. Device kernel runtime measurement with CUPTI
-    runner = profiler.Cupti(finalize=False).measure(lambda *a, **kw: lowered(*a, **kw))
+    runner = profiler.Cupti(finalize=False).measure(compiled)
 
     timings = []
     for _ in range(iterations):
-        res, duration_ms = runner(*args, **kwargs)
+        res, duration_ms = runner(*args)
         res.block_until_ready()
         timings.append(duration_ms)
 
