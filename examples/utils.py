@@ -1,10 +1,15 @@
 import time
+import pathlib
+import shutil
+import tempfile
 import dataclasses
-from typing import Any, Callable, Sequence
+from contextlib import contextmanager
+from typing import Any, Callable, Sequence, Iterator
 
 import jax
 import jax.numpy as jnp
 from jax.experimental.mosaic.gpu import profiler
+from xprof.cli.tools import get_kernel_stats_tool
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -140,3 +145,97 @@ def benchmark(
         peak_memory_mb=peak_mem_mb,
         cupti_times_ms=tuple(timings),
     )
+
+
+@contextmanager
+def profile_xprof(profile_dir=None, event_filter_regex=None):
+    """Profiles XLA device operations and collects XProf kernel statistics.
+
+    Creates a dedicated profiling run directory and records a JAX device trace
+    while the context manager body executes. After tracing completes, the
+    resulting XPlane trace is processed using XProf's kernel statistics tool.
+
+    Profiling artifacts are retained only after a successful run. If tracing or
+    post-processing fails, the run directory is removed so incomplete profiling
+    artifacts are not left behind.
+
+    The yielded dictionary is populated after the context manager body completes
+    successfully.
+
+    Args:
+        profile_dir: Parent directory in which to create the profiling run
+            directory. If not provided, a directory is created in the system
+            temporary directory. Defaults to `None`
+        event_filter_regex: Optional regular expression used to restrict which trace
+            events are included when computing kernel statistics.
+
+    Yields:
+        A mutable dictionary populated with profiling results after successful
+        completion. It contains:
+
+        - "total_device_time_ms": Total matched device execution time in milliseconds.
+        - "summary": Full dictionary returned by XProf kernel statistics.
+        - "trace_dir": Path to the retained profiling run directory.
+
+    Raises:
+        ValueError: If the active JAX backend is CPU.
+        RuntimeError: If profiling completes without producing an XPlane trace file.
+        Exception: Propagates exceptions raised by the profiled code or XProf
+            post-processing after cleaning up the incomplete run directory.
+
+    Example:
+        >>> with profile_xprof() as stats:
+        ...    result = jax.jit(fn)(inputs)
+        ...    jax.block_until_ready(result)
+        ...
+        >>> print(stats["total_device_time_ms"])
+        >>> print(stats["trace_dir"])
+    """
+
+    if jax.default_backend() == "cpu":
+        raise ValueError("XProf profiling requires GPU or TPU backend.")
+
+    if profile_dir is not None:
+        parent_path = pathlib.Path(profile_dir)
+        parent_path.mkdir(parents=True, exist_ok=True)
+        run_dir = pathlib.Path(tempfile.mkdtemp(prefix="run_", dir=parent_path))
+    else:
+        run_dir = pathlib.Path(tempfile.mkdtemp(prefix="xprof_profile_"))
+
+    stats = {}
+    completed = False
+
+    try:
+        with jax.profiler.trace(str(run_dir)):
+            yield stats
+
+        trace_files = list(run_dir.glob("**/*.xplane.pb"))
+        if not trace_files:
+            raise RuntimeError(
+                f"No profile trace file found in {run_dir}. Ensure device operations "
+                "were executed and blocked using `jax.block_until_ready()`."
+            )
+
+        profile_data = jax.profiler.ProfileData.from_serialized_xspace(
+            trace_files[0].read_bytes()
+        )
+
+        matchers = (event_filter_regex,) if event_filter_regex else None
+        summary = get_kernel_stats_tool.compute_kernel_stats(
+            profile_data,
+            output_format="dict",
+            include_summary=True,
+            trace_matchers=matchers,
+        )
+
+        device_time_us = summary.get("total_device_duration_us", 0.0)
+
+        stats["total_device_time_ms"] = device_time_us / 1000.0
+        stats["summary"] = summary
+        stats["trace_dir"] = run_dir
+
+        completed = True
+
+    finally:
+        if not completed and run_dir.exists():
+            shutil.rmtree(run_dir)
