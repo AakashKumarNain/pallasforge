@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Hopper WGMMA Matmul Pipeline (Pallas-JAX)</title>
+<style>
+  :root {
+    --bg-color: #0b0f19;
+    --card-bg: #111827;
+    --border-color: #1e293b;
+    --lhs-color: #38bdf8;
+    --rhs-color: #34d399;
+    --out-color: #fbbf24;
+    --smem-color: #c084fc;
+    --text-main: #f8fafc;
+    --text-dim: #94a3b8;
+    --accent: #6366f1;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background-color: var(--bg-color);
+    color: var(--text-main);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 16px;
+    user-select: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  #container {
+    width: 1180px;
+    max-width: 98vw;
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 14px;
+    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Header banner */
+  .header {
+    padding: 14px 24px;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #0f172a;
+  }
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .header h1 {
+    font-size: 1.15rem;
+    font-weight: 600;
+    color: var(--text-main);
+    letter-spacing: -0.01em;
+  }
+  .badge {
+    background: rgba(56, 189, 248, 0.12);
+    color: var(--lhs-color);
+    border: 1px solid rgba(56, 189, 248, 0.3);
+    padding: 3px 9px;
+    border-radius: 6px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+  }
+  .act-indicator {
+    font-size: 0.88rem;
+    color: var(--out-color);
+    font-weight: 600;
+  }
+
+  /* Canvas viewport */
+  .canvas-wrapper {
+    position: relative;
+    width: 100%;
+    height: 530px;
+    background: #090d16;
+  }
+  canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  /* Bottom Controls & Intuition Subtitle Bar */
+  .footer {
+    padding: 14px 24px;
+    background: #0f172a;
+    border-top: 1px solid var(--border-color);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .subtitle-bar {
+    background: #1e293b;
+    border-left: 4px solid var(--out-color);
+    padding: 10px 16px;
+    border-radius: 6px;
+    font-size: 0.88rem;
+    line-height: 1.5;
+    color: #e2e8f0;
+    min-height: 48px;
+    display: flex;
+    align-items: center;
+  }
+  .subtitle-bar code {
+    background: rgba(0,0,0,0.3);
+    color: #38bdf8;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: ui-monospace, monospace;
+    font-size: 0.82rem;
+    margin: 0 3px;
+  }
+  .subtitle-bar b {
+    color: #fff;
+    font-weight: 600;
+  }
+
+  .controls-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .icon-btn {
+    background: #1e293b;
+    border: 1px solid #334155;
+    color: var(--text-main);
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .icon-btn:hover {
+    background: #334155;
+    border-color: #475569;
+    transform: translateY(-1px);
+  }
+  .icon-btn svg {
+    width: 18px;
+    height: 18px;
+    fill: currentColor;
+  }
+
+  .slider-container {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  input[type="range"] {
+    flex: 1;
+    height: 6px;
+    accent-color: var(--out-color);
+    background: #334155;
+    border-radius: 3px;
+    cursor: pointer;
+    outline: none;
+  }
+
+  .time-display {
+    font-family: ui-monospace, monospace;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    min-width: 95px;
+  }
+
+  .chapter-tabs {
+    display: flex;
+    gap: 6px;
+  }
+  .tab-btn {
+    font-size: 0.75rem;
+    padding: 6px 12px;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .tab-btn:hover {
+    background: #283548;
+    color: var(--text-main);
+  }
+  .tab-btn.active {
+    background: rgba(251, 191, 36, 0.15);
+    border-color: var(--out-color);
+    color: var(--out-color);
+  }
+
+  #speedBtn {
+    background: #1e293b;
+    border: 1px solid #334155;
+    color: var(--text-main);
+    padding: 0 10px;
+    height: 36px;
+    border-radius: 8px;
+    font-size: 0.82rem;
+    font-weight: 700;
+    cursor: pointer;
+    min-width: 52px;
+  }
+  #speedBtn:hover {
+    background: #334155;
+  }
+</style>
+</head>
+<body>
+
+<div id="container">
+  <div class="header">
+    <div class="header-left">
+      <h1>Hopper WGMMA Matmul Pipeline</h1>
+      <span class="badge">Pallas-JAX</span>
+    </div>
+    <div class="act-indicator" id="actIndicator">Act 1: Global Tiling</div>
+  </div>
+
+  <div class="canvas-wrapper">
+    <canvas id="animCanvas"></canvas>
+  </div>
+
+  <div class="footer">
+    <div class="subtitle-bar" id="subtitleText">
+      Initializing Kernel...
+    </div>
+
+    <div class="controls-row">
+      <button class="icon-btn" id="playBtn" title="Play/Pause">
+        <svg id="playIcon" style="display:none" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+        <svg id="pauseIcon" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+      </button>
+
+      <button class="icon-btn" id="resetBtn" title="Restart">
+        <svg viewBox="0 0 24 24"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+      </button>
+
+      <div class="slider-container">
+        <input type="range" id="timelineSlider" min="0" max="60" step="0.05" value="0" />
+        <span class="time-display" id="timeDisplay">00:00 / 01:00</span>
+      </div>
+
+      <div class="chapter-tabs">
+        <button class="tab-btn active" onclick="seekTo(0)">1. Tiling</button>
+        <button class="tab-btn" onclick="seekTo(12)">2. Panels & Snake</button>
+        <button class="tab-btn" onclick="seekTo(28)">3. 4-Stage SMEM</button>
+        <button class="tab-btn" onclick="seekTo(48)">4. Writeback</button>
+      </div>
+
+      <button id="speedBtn">1.0x</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById("animCanvas");
+const ctx = canvas.getContext("2d");
+
+const TOTAL_DURATION = 60.0;
+const VIRTUAL_WIDTH = 1180;
+const VIRTUAL_HEIGHT = 530;
+
+let currentTime = 0;
+let isPlaying = true;
+let playbackSpeed = 1.0;
+let lastTimestamp = performance.now();
+
+// Setup HiDPI Canvas
+function setupCanvasHiDPI() {
+  const dpr = window.devicePixelRatio || 2;
+  canvas.width = VIRTUAL_WIDTH * dpr;
+  canvas.height = VIRTUAL_HEIGHT * dpr;
+  ctx.resetTransform();
+  ctx.scale(dpr, dpr);
+}
+setupCanvasHiDPI();
+window.addEventListener("resize", setupCanvasHiDPI);
+
+// UI references
+const playBtn = document.getElementById("playBtn");
+const playIcon = document.getElementById("playIcon");
+const pauseIcon = document.getElementById("pauseIcon");
+const resetBtn = document.getElementById("resetBtn");
+const speedBtn = document.getElementById("speedBtn");
+const timelineSlider = document.getElementById("timelineSlider");
+const timeDisplay = document.getElementById("timeDisplay");
+const actIndicator = document.getElementById("actIndicator");
+const subtitleText = document.getElementById("subtitleText");
+const tabBtns = document.querySelectorAll(".tab-btn");
+
+function seekTo(sec) {
+  currentTime = sec;
+  updateUI();
+}
+
+playBtn.onclick = () => {
+  isPlaying = !isPlaying;
+  playIcon.style.display = isPlaying ? "none" : "block";
+  pauseIcon.style.display = isPlaying ? "block" : "none";
+};
+
+resetBtn.onclick = () => {
+  currentTime = 0;
+  isPlaying = true;
+  playIcon.style.display = "none";
+  pauseIcon.style.display = "block";
+};
+
+speedBtn.onclick = () => {
+  if (playbackSpeed === 1.0) playbackSpeed = 1.5;
+  else if (playbackSpeed === 1.5) playbackSpeed = 2.0;
+  else if (playbackSpeed === 2.0) playbackSpeed = 0.5;
+  else playbackSpeed = 1.0;
+  speedBtn.innerText = playbackSpeed.toFixed(1) + "x";
+};
+
+timelineSlider.oninput = (e) => {
+  currentTime = parseFloat(e.target.value);
+  updateUI();
+};
+
+function updateUI() {
+  timelineSlider.value = currentTime;
+  const curM = String(Math.floor(currentTime / 60)).padStart(2, '0');
+  const curS = String(Math.floor(currentTime % 60)).padStart(2, '0');
+  timeDisplay.innerText = `${curM}:${curS} / 01:00`;
+
+  tabBtns.forEach((btn, i) => {
+    const starts = [0, 12, 28, 48];
+    const ends = [12, 28, 48, 60];
+    if (currentTime >= starts[i] && currentTime < ends[i]) {
+      btn.classList.add("active");
+    } else {
+      btn.classList.remove("active");
+    }
+  });
+}
+
+// -------------------------------------------------------------
+// Auto Text-Wrapping Helper (Fixes all text overflows)
+// -------------------------------------------------------------
+function drawWrappedText(context, text, x, y, maxWidth, lineHeight) {
+  if (!text) return y + lineHeight;
+  const words = text.split(" ");
+  let line = "";
+  let curY = y;
+
+  for (let n = 0; n < words.length; n++) {
+    const testLine = line + (line === "" ? "" : " ") + words[n];
+    const metrics = context.measureText(testLine);
+    if (metrics.width > maxWidth && n > 0) {
+      context.fillText(line, x, curY);
+      line = words[n];
+      curY += lineHeight;
+    } else {
+      line = testLine;
+    }
+  }
+  context.fillText(line, x, curY);
+  return curY + lineHeight;
+}
+
+// -------------------------------------------------------------
+// Render Driver
+// -------------------------------------------------------------
+function render() {
+  ctx.clearRect(0, 0, VIRTUAL_WIDTH, VIRTUAL_HEIGHT);
+
+  if (currentTime < 12) {
+    renderAct1(currentTime);
+  } else if (currentTime < 28) {
+    renderAct2(currentTime - 12);
+  } else if (currentTime < 48) {
+    renderAct3(currentTime - 28);
+  } else {
+    renderAct4(currentTime - 48);
+  }
+}
+
+// -------------------------------------------------------------
+// ACT 1: Global Matrix Tiling (0s - 12s)
+// -------------------------------------------------------------
+function renderAct1(t) {
+  actIndicator.innerText = "Act 1: Global Problem & 2D Tiling";
+  subtitleText.innerHTML = `<span><b>2D Matrix Tiling:</b> Large matrices <code>LHS (M×K)</code> and <code>RHS (K×N)</code> are sliced into atomic tiles (<code>64×128</code> and <code>128×128</code>). Each tile is computed in SMEM & accumulator registers.</span>`;
+
+  drawMatrixBox(80, 95, 170, 240, "#38bdf8", "LHS (M × K)", "bfloat16");
+  drawMatrixBox(300, 65, 250, 160, "#34d399", "RHS (K × N)", "bfloat16");
+  drawMatrixBox(300, 255, 250, 240, "#fbbf24", "Output (M × N)", "Accumulated Result");
+
+  ctx.fillStyle = "#64748b";
+  ctx.font = "bold 26px sans-serif";
+  ctx.fillText("×", 265, 185);
+  ctx.fillText("=", 265, 375);
+
+  const gridProgress = Math.min(1, Math.max(0, (t - 2.5) / 3.5));
+  if (gridProgress > 0) {
+    ctx.strokeStyle = `rgba(255, 255, 255, ${gridProgress * 0.35})`;
+    ctx.lineWidth = 1.5;
+
+    for (let r = 1; r < 4; r++) drawLine(80, 95 + r * 60, 250, 95 + r * 60);
+    drawLine(80 + 85, 95, 80 + 85, 335);
+
+    for (let c = 1; c < 3; c++) drawLine(300 + c * 83.3, 65, 300 + c * 83.3, 225);
+    drawLine(300, 65 + 80, 550, 65 + 80);
+
+    for (let r = 1; r < 4; r++) drawLine(300, 255 + r * 60, 550, 255 + r * 60);
+    for (let c = 1; c < 3; c++) drawLine(300 + c * 83.3, 255, 300 + c * 83.3, 495);
+  }
+
+  if (t > 6) {
+    const pulse = 0.6 + 0.4 * Math.sin(t * 6);
+    ctx.fillStyle = `rgba(251, 191, 36, ${0.45 * pulse})`;
+    ctx.fillRect(300 + 83.3, 255 + 60, 83.3, 60);
+    ctx.strokeStyle = "#fbbf24";
+    ctx.lineWidth = 2.5;
+    ctx.strokeRect(300 + 83.3, 255 + 60, 83.3, 60);
+
+    ctx.fillStyle = `rgba(56, 189, 248, 0.35)`;
+    ctx.fillRect(80, 95 + 60, 170, 60);
+    ctx.strokeStyle = "#38bdf8";
+    ctx.strokeRect(80, 95 + 60, 170, 60);
+
+    ctx.fillStyle = `rgba(52, 211, 153, 0.35)`;
+    ctx.fillRect(300 + 83.3, 65, 83.3, 160);
+    ctx.strokeStyle = "#34d399";
+    ctx.strokeRect(300 + 83.3, 65, 83.3, 160);
+
+    drawCard(610, 100, 490, 300, "Hopper Tile Dimensions", [
+      "• tile_m = 64  (LHS / OUT slice rows)",
+      "• tile_n = 128 (RHS / OUT slice cols)",
+      "• tile_k = 128 (Reduction step size)",
+      "",
+      "Hardware Alignment Constraints:",
+      "• tile_m % 64 == 0 (Hopper WGMMA requirement)",
+      "• tile_n % 8 == 0  (Tensor Core alignment requirement)",
+      "• Each tile computes K // tile_k reduction steps along K dimension"
+    ]);
+  }
+}
+
+// -------------------------------------------------------------
+// ACT 2: Panels & Snake Rasterization (12s - 28s)
+// -------------------------------------------------------------
+function renderAct2(t) {
+  actIndicator.innerText = "Act 2: Panel Width & Snake Traversal (L2 Cache)";
+  subtitleText.innerHTML = `<span><b>Why Panels & Snake?</b> Restricting traversal inside vertical panels (<code>panel_width=4</code>) with a snake path (<code>⇄</code>) ensures RHS columns remain <b>HOT in L2 Cache</b> between adjacent rows.</span>`;
+
+  const rows = 6, cols = 8;
+  const cellW = 42, cellH = 36;
+  const startX = 80, startY = 110;
+  const panelWidth = 4;
+
+  ctx.fillStyle = "#94a3b8";
+  ctx.font = "bold 13px sans-serif";
+  ctx.fillText("Output Matrix Tile Grid (M/tile_m × N/tile_n)", startX, startY - 18);
+
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const x = startX + c * (cellW + 5);
+      const y = startY + r * (cellH + 5);
+      ctx.fillStyle = "#131b2e";
+      ctx.strokeStyle = "#27354a";
+      ctx.lineWidth = 1;
+      drawRoundedRect(x, y, cellW, cellH, 4, true, true);
+    }
+  }
+
+  // Panel 0 border
+  const p0Width = panelWidth * (cellW + 5) - 5;
+  const p0Height = rows * (cellH + 5) - 5;
+  ctx.strokeStyle = "#38bdf8";
+  ctx.lineWidth = 2.5;
+  drawRoundedRect(startX - 4, startY - 4, p0Width + 8, p0Height + 8, 6, false, true);
+
+  ctx.fillStyle = "#38bdf8";
+  ctx.font = "bold 12px sans-serif";
+  ctx.fillText("Panel 0 (panel_width = 4)", startX, startY + p0Height + 22);
+
+  const totalPanelTiles = rows * panelWidth;
+  const speed = 1.8;
+  const currentStep = Math.min(totalPanelTiles - 1, Math.floor(t * speed));
+
+  let pathCoords = [];
+  for (let idx = 0; idx <= currentStep; idx++) {
+    const row = Math.floor(idx / panelWidth);
+    let colOffset = idx % panelWidth;
+    if (row % 2 !== 0) colOffset = panelWidth - colOffset - 1;
+    pathCoords.push({ r: row, c: colOffset, idx });
+  }
+
+  pathCoords.forEach((pt, i) => {
+    const x = startX + pt.c * (cellW + 5);
+    const y = startY + pt.r * (cellH + 5);
+    const isLatest = i === pathCoords.length - 1;
+
+    ctx.fillStyle = isLatest ? "#fbbf24" : "rgba(251, 191, 36, 0.4)";
+    drawRoundedRect(x, y, cellW, cellH, 4, true, false);
+
+    ctx.fillStyle = isLatest ? "#000" : "#fff";
+    ctx.font = "bold 11px sans-serif";
+    ctx.fillText(pt.idx, x + cellW/2 - 6, y + cellH/2 + 4);
+  });
+
+  if (pathCoords.length > 1) {
+    ctx.strokeStyle = "#fbbf24";
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    pathCoords.forEach((pt, i) => {
+      const x = startX + pt.c * (cellW + 5) + cellW/2;
+      const y = startY + pt.r * (cellH + 5) + cellH/2;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+
+  const curTile = pathCoords[pathCoords.length - 1];
+  const isTurnaround = curTile && (curTile.c === 3 || curTile.c === 0) && curTile.r > 0;
+
+  drawCard(510, 85, 600, 360, "Hardware L2 Cache Efficiency", [
+    `Active tile #${curTile ? curTile.idx : 0}  —  Row ${curTile?curTile.r:0}, Col ${curTile?curTile.c:0}`,
+    `Scan direction: ${curTile && curTile.r % 2 === 0 ? "left to right" : "right to left"}`,
+    "",
+    "Why the snake pattern:",
+    "A naive scan always moves left to right, so it jumps from column 3 back to column 0 at the start of every row — evicting the RHS columns just cached in L2.",
+    "The snake pattern reverses direction each row instead. Row 0 ends at column 3, and row 1 starts there too, so that RHS column is still hot in cache.",
+    "",
+    "panel_width=4 also caps how many RHS columns are active at once, keeping the working set within Hopper's 50MB L2."
+  ]);
+
+  const cacheHit = isTurnaround ? 98 : 78 + Math.sin(t * 3) * 8;
+  drawMeter(535, 400, 545, 22, "L2 Cache Hit Rate", cacheHit, cacheHit > 90 ? "#34d399" : "#38bdf8");
+}
+
+// -------------------------------------------------------------
+// ACT 3: Asynchronous 4-Stage SMEM Pipeline (28s - 48s)
+// -------------------------------------------------------------
+function renderAct3(t) {
+  actIndicator.innerText = "Act 3: 4-Stage Async SMEM Pipeline (Latency Hiding)";
+  subtitleText.innerHTML = `<span><b>Async TMA & WGMMA:</b> GMEM fetches take ~400 cycles. We stage 4 circular buffers in SMEM. While Tensor Cores multiply stage <code>k</code>, asynchronous hardware loads stage <code>k+3</code>.</span>`;
+
+  const stages = 4;
+  const cycleTime = 4.0;
+  const stepIdx = Math.floor(t / cycleTime);
+  const localT = (t % cycleTime) / cycleTime;
+
+  drawMemoryTier(60, 75, 1060, 48, "#38bdf8", "Global Memory / HBM (High Latency ~400 cycles) — Asynchronous TMA Transfers");
+
+  ctx.fillStyle = "#94a3b8";
+  ctx.font = "bold 13px sans-serif";
+  ctx.fillText("Shared Memory (SMEM) — 4 Concurrent Pipeline Stages", 60, 160);
+
+  const slotW = 245, slotH = 100;
+  for (let s = 0; s < stages; s++) {
+    const x = 60 + s * (slotW + 26);
+    const y = 175;
+    const isComputing = (s === (stepIdx % stages));
+    const isFetching = (s === ((stepIdx + 3) % stages));
+
+    let borderColor = "#334155";
+    let bgColor = "#131b2e";
+    let status = "BUFFERED / READY";
+
+    if (isComputing) {
+      borderColor = "#fbbf24";
+      bgColor = "rgba(251, 191, 36, 0.12)";
+      status = "WGMMA COMPUTE";
+    } else if (isFetching) {
+      borderColor = "#38bdf8";
+      bgColor = "rgba(56, 189, 248, 0.12)";
+      status = "ASYNC GMEM LOAD";
+    }
+
+    ctx.fillStyle = bgColor;
+    ctx.strokeStyle = borderColor;
+    ctx.lineWidth = isComputing || isFetching ? 2.5 : 1.5;
+    drawRoundedRect(x, y, slotW, slotH, 8, true, true);
+
+    ctx.fillStyle = borderColor;
+    ctx.font = "bold 13px sans-serif";
+    ctx.fillText(`Stage Slot ${s} (k=${stepIdx + s})`, x + 16, y + 24);
+
+    ctx.fillStyle = "#cbd5e1";
+    ctx.font = "12px sans-serif";
+    ctx.fillText(`LHS: (64×128) bf16`, x + 16, y + 48);
+    ctx.fillText(`RHS: (128×128) bf16`, x + 16, y + 68);
+
+    ctx.fillStyle = borderColor;
+    ctx.font = "bold 11px ui-monospace, monospace";
+    ctx.fillText(status, x + 16, y + 88);
+
+    if (isFetching) {
+      const flowY = y + 8 + localT * (slotH - 16);
+      ctx.fillStyle = "#38bdf8";
+      ctx.beginPath();
+      ctx.arc(x + slotW/2, flowY, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  const accX = 310, accY = 320, accW = 560, accH = 80;
+  ctx.fillStyle = "rgba(251, 191, 36, 0.08)";
+  ctx.strokeStyle = "#fbbf24";
+  ctx.lineWidth = 2.5;
+  drawRoundedRect(accX, accY, accW, accH, 8, true, true);
+
+  ctx.fillStyle = "#fbbf24";
+  ctx.font = "bold 15px sans-serif";
+  ctx.fillText("Hopper Tensor Cores (plgpu.wgmma)", accX + 22, accY + 30);
+  ctx.fillStyle = "#f8fafc";
+  ctx.font = "13px ui-monospace, monospace";
+  ctx.fillText("acc[64, 128] += lhs_smem @ rhs_smem (FP32 Accumulator)", accX + 22, accY + 56);
+
+  const activeComputeSlotX = 60 + (stepIdx % stages) * (slotW + 26) + slotW/2;
+  drawArrow(activeComputeSlotX, 275, accX + accW/2, accY, "#fbbf24");
+
+  ctx.fillStyle = "#94a3b8";
+  ctx.font = "12px ui-monospace, monospace";
+  ctx.fillText(`Reduction Step: ${stepIdx + 1} / 32  |  Pipeline Latency Hidden: 100% (Compute-Bound Overlap)`, 60, 445);
+}
+
+// -------------------------------------------------------------
+// ACT 4: Epilogue & Writeback (48s - 60s)
+// -------------------------------------------------------------
+function renderAct4(t) {
+  actIndicator.innerText = "Act 4: Precision Cast & Asynchronous Writeback";
+  subtitleText.innerHTML = `<span><b>Epilogue:</b> Once reduction along K finishes, the FP32 accumulator in registers is cast to <code>bfloat16</code>, committed to <code>out_smem</code>, and copied asynchronously to global memory via <code>copy_smem_to_gmem</code>.</span>`;
+
+  const animPhase = Math.min(1, t / 7.0);
+
+  // Box 1: FP32 Accumulator Registers
+  const rX = 60, rY = 115, rW = 270, rH = 155;
+  ctx.fillStyle = "#131b2e";
+  ctx.strokeStyle = "#fbbf24";
+  ctx.lineWidth = 2.5;
+  drawRoundedRect(rX, rY, rW, rH, 10, true, true);
+  
+  ctx.fillStyle = "#fbbf24";
+  ctx.font = "bold 15px sans-serif";
+  ctx.fillText("Accumulator Registers", rX + 18, rY + 32);
+  ctx.fillStyle = "#cbd5e1";
+  ctx.font = "13px sans-serif";
+  ctx.fillText("• Precision: float32", rX + 18, rY + 65);
+  ctx.fillText("• Shape: (tile_m, tile_n)", rX + 18, rY + 92);
+  ctx.fillText("• Tile: 64 × 128 items", rX + 18, rY + 119);
+
+  // Arrow 1: Cast
+  const isCast = animPhase > 0.3;
+  const arrow1StartX = rX + rW;
+  const arrow1EndX = 455;
+  const arrow1Y = rY + rH/2;
+  
+  drawArrow(arrow1StartX, arrow1Y, arrow1EndX, arrow1Y, isCast ? "#c084fc" : "#475569");
+  ctx.fillStyle = isCast ? "#e9d5ff" : "#64748b";
+  ctx.font = "bold 12px ui-monospace, monospace";
+  ctx.textAlign = "center";
+  ctx.fillText(".astype(bf16)", (arrow1StartX + arrow1EndX) / 2, arrow1Y - 12);
+  ctx.textAlign = "left";
+
+  // Box 2: Shared Memory (out_smem)
+  const smemX = 455, smemY = 115, smemW = 270, smemH = 155;
+  ctx.fillStyle = isCast ? "rgba(192, 132, 252, 0.12)" : "#131b2e";
+  ctx.strokeStyle = isCast ? "#c084fc" : "#334155";
+  ctx.lineWidth = 2.5;
+  drawRoundedRect(smemX, smemY, smemW, smemH, 10, true, true);
+  
+  ctx.fillStyle = "#c084fc";
+  ctx.font = "bold 15px sans-serif";
+  ctx.fillText("out_smem (Shared Mem)", smemX + 18, smemY + 32);
+  ctx.fillStyle = "#cbd5e1";
+  ctx.font = "13px sans-serif";
+  ctx.fillText("• Type: bfloat16 (2 bytes)", smemX + 18, smemY + 65);
+  ctx.fillText("• SwizzleTransform(128)", smemX + 18, smemY + 92);
+  ctx.fillText("• plgpu.commit_smem()", smemX + 18, smemY + 119);
+
+  // Arrow 2: GMEM Copy
+  const isWritten = animPhase > 0.7;
+  const arrow2StartX = smemX + smemW;
+  const arrow2EndX = 850;
+  const arrow2Y = smemY + smemH/2;
+  
+  drawArrow(arrow2StartX, arrow2Y, arrow2EndX, arrow2Y, isWritten ? "#34d399" : "#475569");
+  ctx.fillStyle = isWritten ? "#a7f3d0" : "#64748b";
+  ctx.font = "bold 12px ui-monospace, monospace";
+  ctx.textAlign = "center";
+  ctx.fillText("copy_to_gmem()", (arrow2StartX + arrow2EndX) / 2, arrow2Y - 12);
+  ctx.textAlign = "left";
+
+  // Box 3: Global Memory Output (out_gmem)
+  const gmemX = 850, gmemY = 115, gmemW = 270, gmemH = 155;
+  ctx.fillStyle = isWritten ? "rgba(52, 211, 153, 0.12)" : "#131b2e";
+  ctx.strokeStyle = isWritten ? "#34d399" : "#334155";
+  ctx.lineWidth = 2.5;
+  drawRoundedRect(gmemX, gmemY, gmemW, gmemH, 10, true, true);
+  
+  ctx.fillStyle = "#34d399";
+  ctx.font = "bold 15px sans-serif";
+  ctx.fillText("out_gmem (HBM Slice)", gmemX + 18, gmemY + 32);
+  ctx.fillStyle = "#cbd5e1";
+  ctx.font = "13px sans-serif";
+  ctx.fillText("• Slice: [row_idx, col_idx]", gmemX + 18, gmemY + 65);
+  ctx.fillText("• wait_smem_to_gmem()", gmemX + 18, gmemY + 92);
+  ctx.fillText("• Status: Tile Completed ✓", gmemX + 18, gmemY + 119);
+
+  // Summary Card below
+  drawCard(60, 310, 1060, 140, "Summary: End-to-End Hopper Execution", [
+    "✓ 2D Panel + Snake rasterization maximizes L2 cache hit rate on RHS matrix columns.",
+    "✓ 4-Stage SMEM pipeline completely overlaps GMEM TMA loads with WGMMA Tensor Core math.",
+    "✓ Registers hold full FP32 accumulator tile, eliminating costly intermediate memory spills."
+  ]);
+}
+
+// -------------------------------------------------------------
+// Drawing Primitives
+// -------------------------------------------------------------
+function drawMatrixBox(x, y, w, h, color, title, subtitle) {
+  ctx.fillStyle = "rgba(19, 27, 46, 0.8)";
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  drawRoundedRect(x, y, w, h, 8, true, true);
+
+  ctx.fillStyle = color;
+  ctx.font = "bold 14px sans-serif";
+  ctx.fillText(title, x + 16, y + 28);
+
+  ctx.fillStyle = "#94a3b8";
+  ctx.font = "12px sans-serif";
+  ctx.fillText(subtitle, x + 16, y + 48);
+}
+
+function drawCard(x, y, w, h, title, lines) {
+  ctx.fillStyle = "#131b2e";
+  ctx.strokeStyle = "#334155";
+  ctx.lineWidth = 1.5;
+  drawRoundedRect(x, y, w, h, 8, true, true);
+
+  ctx.fillStyle = "#fbbf24";
+  ctx.font = "bold 14px sans-serif";
+  ctx.fillText(title, x + 20, y + 30);
+
+  ctx.fillStyle = "#cbd5e1";
+  ctx.font = "13px sans-serif";
+  
+  let currentY = y + 58;
+  const contentWidth = w - 40; // 20px padding on each side
+
+  lines.forEach((line) => {
+    if (line === "") {
+      currentY += 8;
+    } else {
+      currentY = drawWrappedText(ctx, line, x + 20, currentY, contentWidth, 22);
+    }
+  });
+}
+
+function drawMeter(x, y, w, h, label, val, color) {
+  ctx.fillStyle = "#e2e8f0";
+  ctx.font = "bold 12px sans-serif";
+  ctx.fillText(`${label}: ${val.toFixed(0)}%`, x, y - 8);
+
+  ctx.fillStyle = "#0f172a";
+  drawRoundedRect(x, y, w, h, 4, true, false);
+
+  ctx.fillStyle = color;
+  drawRoundedRect(x, y, (w * val) / 100, h, 4, true, false);
+  ctx.strokeStyle = "#334155";
+  drawRoundedRect(x, y, w, h, 4, false, true);
+}
+
+function drawMemoryTier(x, y, w, h, color, title) {
+  ctx.fillStyle = "#131b2e";
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  drawRoundedRect(x, y, w, h, 6, true, true);
+  ctx.fillStyle = "#cbd5e1";
+  ctx.font = "bold 13px sans-serif";
+  ctx.fillText(title, x + 20, y + 30);
+}
+
+function drawLine(x1, y1, x2, y2) {
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+}
+
+function drawArrow(x1, y1, x2, y2, color = "#fbbf24") {
+  const headlen = 9;
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const angle = Math.atan2(dy, dx);
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - headlen * Math.cos(angle - Math.PI / 6), y2 - headlen * Math.sin(angle - Math.PI / 6));
+  ctx.lineTo(x2 - headlen * Math.cos(angle + Math.PI / 6), y2 - headlen * Math.sin(angle + Math.PI / 6));
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawRoundedRect(x, y, w, h, radius, fill, stroke) {
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.lineTo(x + w - radius, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+  ctx.lineTo(x + w, y + h - radius);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+  ctx.lineTo(x + radius, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+  ctx.lineTo(x, y + radius);
+  ctx.quadraticCurveTo(x, y, x + radius, y);
+  ctx.closePath();
+  if (fill) ctx.fill();
+  if (stroke) ctx.stroke();
+}
+
+// -------------------------------------------------------------
+// Animation Loop
+// -------------------------------------------------------------
+function loop(timestamp) {
+  const dt = (timestamp - lastTimestamp) / 1000.0;
+  lastTimestamp = timestamp;
+
+  if (isPlaying) {
+    currentTime += dt * playbackSpeed;
+    if (currentTime >= TOTAL_DURATION) {
+      currentTime = 0;
+    }
+    updateUI();
+  }
+
+  render();
+  requestAnimationFrame(loop);
+}
+
+requestAnimationFrame((ts) => {
+  lastTimestamp = ts;
+  loop(ts);
+});
+</script>
+</body>
+</html>
