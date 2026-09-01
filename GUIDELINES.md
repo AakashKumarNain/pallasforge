@@ -30,3 +30,11 @@ Before submitting a pull request, run the following commands:
 ruff check
 ruff format
 ```
+
+## 4. LLM-assisted Coding and PR
+
+You are free to use any LLM to write code, but a few things that are prohibited:
+
+- Please do not write documentation using LLMs. Their yapping is a curse for the documentation. Any PR with gibberish documentation will be rejected instantly.
+- Ensure to double check your code, and that it follows the code guidelines
+- Using LLMs for issues and PRs is strictly prohibited for the same reason of unnecessary yapping
