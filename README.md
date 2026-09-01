@@ -13,4 +13,4 @@ There are three major gaps that we want to address:
 
 Given how people have changed the meaning of OSS, we want to take a different approach here. Instead of starting a project and then calling for community contributions, we want to develop it *with the community* from day one. Community here does not mean only individuals, but it also includes big teams who love writing kernels, and want to contribute to OSS, JAX/Pallas, and GPUs. We are eager and very much looking forward to contributions from the JAX-Pallas team, and Nvidia's JAX teams.
 
-Please refer to the ideas listed [here](./PROPOSALS.md) for contributions.
+Please refer to the ideas listed [here](./PROPOSALS.md) for contributions. Also, please read the [code guidelines](./GUIDELINES.md) before opening a PR. 
