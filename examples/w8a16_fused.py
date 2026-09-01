@@ -13,18 +13,18 @@ from utils import get_max_smem_bytes
 def quantize_weight_per_output_channel(weight):
     """Quantizes weights symmetrically with one BF16 scale per output channel."""
 
-    weight = weight.asype(jnp.float32)
+    weight = weight.astype(jnp.float32)
     maxval = jnp.max(jnp.abs(weight), axis=1)
-    scale = jnp.where(weight == 0.0, 1.0, maxval / 127.0).astype(jnp.bfloat16)
+    scale = jnp.where(maxval == 0.0, 1.0, maxval / 127.0).astype(jnp.bfloat16)
     quantized = jnp.round(weight / scale[:, None]).astype(jnp.float32)
     quantized = jnp.clip(quantized, -127, 127).astype(jnp.int8)
     return quantized, scale
 
 
-def simple_w816_matmul(quantized_weights, weight_scale, activations):
+def simple_w8a16_matmul(quantized_weights, weight_scale, activations):
     """Performs W8A16 op with INT8 -> BF16 weight dequantization."""
     dequnatized = quantized_weights.astype(jnp.bfloat16) * weight_scale[:, None]
-    return jnp.matmul(dequnatized, activations)
+    return jnp.matmul(dequnatized, activations)  # Shape error: (N, K) @ (M, K)
 
 
 def matmul(
@@ -51,7 +51,7 @@ def matmul(
     m_padding = padded_m - m
 
     if m_padding:
-        padded_activations = jnp.pad(activations, (0, m_padding), (0, 0))
+        padded_activations = jnp.pad(activations, ((0, m_padding), (0, 0)))
     else:
         padded_activations = activations
 
@@ -64,7 +64,7 @@ def matmul(
     # GPU Transforms or the layouts (WGMMA Hopper swizzles)
     activation_transforms = (plgpu.TilingTransform((8, 64)), plgpu.SwizzleTransform(128))
     weight_transforms     = (plgpu.TilingTransform((8, 128)), plgpu.SwizzleTransform(128))
-    output_transforms     = (plgpu.SwizzleTransform(128),)
+    output_transforms     = (plgpu.TilingTransform((1, 64)), plgpu.SwizzleTransform(128),)
 
     # Shared Memory (SMEM) allocation sizing
     activation_stage_bytes = tile_m * tile_k * activations_bytes_per_elem
@@ -204,7 +204,7 @@ def matmul(
 
     output = plgpu.kernel(
         kernel,
-        out_type=jax.ShapeDtypeStruct((m, n), dtype=jnp.bfloat16),
+        out_type=jax.ShapeDtypeStruct((padded_m, n), dtype=jnp.bfloat16),
         scratch_types={
             "out_smem": plgpu.SMEM(
                 (tile_m, tile_n),
@@ -214,7 +214,7 @@ def matmul(
         },
         grid=launch_grid,
         grid_names=grid_names,
-        kernel_name="hopper_bf16_matmul",
+        kernel_name="hopper_w8a16_matmul",
         compiler_params=plgpu.CompilerParams(
             approx_math=True, unsafe_no_auto_barriers=True
         ),
