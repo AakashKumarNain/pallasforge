@@ -11,13 +11,9 @@ This visualization follows one output tile through a Hopper WGMMA kernel written
 - overlap data loading with Tensor Core work, and
 - write the result back to global memory.
 
-<iframe
-  src="../visualizations/simple_matmul.html"
-  title="Hopper WGMMA matrix multiplication pipeline"
-  loading="lazy"
-  style="width: 100%; height: 680px; border: 0; border-radius: 12px;"
-  allowfullscreen>
-</iframe>
+[![Hopper WGMMA pipeline](../visualizations/simple_matmul-preview.gif)](
+  https://aakashkumarnain.github.io/pallasforge/visualizations/simple_matmul.html
+)
 
 ## 1. Break the problem into tiles
 
