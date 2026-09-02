@@ -22,7 +22,7 @@ def quantize_weight_per_output_channel(weight):
 
 def simple_w8a16_matmul(quantized_weights, weight_scale, activations):
     """Performs W8A16 op with INT8 -> BF16 weight dequantization."""
-    dequnatized = quantized_weights.astype(jnp.bfloat16) * weight_scale[:, None]
+    dequantized = quantized_weight.astype(jnp.bfloat16) * weight_scale[:, None]
     return jnp.matmul(activations, dequantized.T)
 
 
