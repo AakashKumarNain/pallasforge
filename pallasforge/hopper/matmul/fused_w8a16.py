@@ -20,16 +20,16 @@ def quantize_weight_per_output_channel(weight):
     return quantized, scale
 
 
-def simple_w8a16_matmul(quantized_weights, weight_scale, activations):
+def simple_w8a16_matmul(quantized_weight, weight_scale, activations):
     """Performs W8A16 op with INT8 -> BF16 weight dequantization."""
     dequantized = quantized_weight.astype(jnp.bfloat16) * weight_scale[:, None]
     return jnp.matmul(activations, dequantized.T)
 
 
 def matmul(
-    activations,
     weights,
     scale,
+    activations,
     tile_m=64,
     tile_n=64,
     tile_k=128,
@@ -59,30 +59,42 @@ def matmul(
     num_tiles_n = n // tile_n
     num_tiles_k = k // tile_k
     total_tiles_mn = num_tiles_m * num_tiles_n
-    
+
     # Some validations
     if activations.dtype != jnp.bfloat16:
         raise ValueError("Activations must be of dtype `jnp.bfloat16`")
-    if quantized_weight.dtype != jnp.int8:
+    if weights.dtype != jnp.int8:
         raise ValueError("Quantized weights must be of dtype `jnp.int8`")
-    if weight_scale.dtype != jnp.bfloat16:
+    if scale.dtype != jnp.bfloat16:
         raise ValueError("Weight scales must be of dtype `jnp.bfloat16`")
 
     if k != k_weight:
-        raise ValueError(f"Reduction dimension must match. Got {k} for activations and {k_weight} for weights")
+        raise ValueError(
+            f"Reduction dimension must match. Got {k} for activations and {k_weight} for weights"
+        )
 
-    if weight_scale.shape != (n,):
-        raise ValueError(f"Weight scales must have shape ({n},). Got {weight_scale.shape}")
+    if scale.shape != (n,):
+        raise ValueError(f"Weight scales must have shape ({n},). Got {scale.shape}")
 
-    if tile_m <= 0 or tile_n <= 0 or tile_k <= 0 or num_pipeline_stages <= 0 or panel_width <= 0:
-        raise ValueError("Tile dimensions, pipeline stages, and panel width must be positive!")
+    if (
+        tile_m <= 0
+        or tile_n <= 0
+        or tile_k <= 0
+        or num_pipeline_stages <= 0
+        or panel_width <= 0
+    ):
+        raise ValueError(
+            "Tile dimensions, pipeline stages, and panel width must be positive!"
+        )
 
     if n % tile_n or k % tile_k:
         raise ValueError("tile_n and tile_k must evenly divide the N and K dimensions")
 
     # weight @ activations.T produces [tile_n, tile_m], so tile_n is WGMMA's M dimension.
     if tile_n % 64 or tile_m % 8:
-        raise ValueError("tile_n and tile_m must be multiples of 64 and 8 respectively for Hopper WGMMA")
+        raise ValueError(
+            "tile_n and tile_m must be multiples of 64 and 8 respectively for Hopper WGMMA"
+        )
 
     if tile_k % 128:
         raise ValueError("tile_k must be a multiple of 128 for the INT8 weight layout")
@@ -257,3 +269,43 @@ def matmul(
         ),
     )(padded_activations, weights, scale)
     return output[:m, :]
+
+
+def main():
+    key = jax.random.PRNGKey(0)
+
+    # Realistic LLM decode shapes (M, K, N) across QKV, MLP-Gate/Up, and MLP-Down
+    # M represents decode batch size (1 for single-stream, 4-16 for batched decode)
+    shapes = [
+        (1, 4096, 4096),    # LLaMA-8B Single-token Attention
+        (1, 4096, 14336),   # LLaMA-8B Single-token MLP Gate/Up
+        (1, 14336, 4096),   # LLaMA-8B Single-token MLP Down
+        (4, 4096, 4096),    # LLaMA-8B Small Batched Decode
+        (16, 4096, 14336),  # LLaMA-8B Batched MLP
+        (1, 8192, 8192),    # LLaMA-70B Single-token Attention
+        (1, 8192, 28672),   # LLaMA-70B Single-token MLP Gate/Up
+    ]
+
+    for m, k, n in shapes:
+        k_act, k_w, key = jax.random.split(key, 3)
+
+        # Activations: (M, K) in BF16
+        activations = (jax.random.normal(k_act, (m, k)) * 0.1).astype(jnp.bfloat16)
+
+        # Weights: (N, K) quantized symmetrically to INT8 with BF16 scales
+        raw_weight = jax.random.normal(k_w, (n, k), dtype=jnp.float32) * 0.05
+        weights, scale = quantize_weight_per_output_channel(raw_weight)
+
+        # Reference vs Kernel
+        ref = simple_w8a16_matmul(weights, scale, activations)
+        out = matmul(weights, scale, activations)
+
+        # BF16 tolerance: rtol=1e-2 matches 7-bit mantissa precision; atol=5e-2 covers zero-floor
+        passed = jnp.allclose(ref, out, rtol=1e-2, atol=5e-2)
+        print(f"Shape (M={m:<2}, K={k:<5}, N={n:<5}) -> {'PASS' if passed else 'FAIL'}")
+        
+        assert passed, f"Kernel mismatch on shape (M={m}, K={k}, N={n})"
+
+
+if __name__ == "__main__":
+    main()
