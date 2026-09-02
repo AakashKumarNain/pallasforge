@@ -11,9 +11,14 @@ This visualization follows one output tile through a Hopper WGMMA kernel written
 - overlap data loading with Tensor Core work, and
 - write the result back to global memory.
 
-![Hopper WGMMA pipeline](../visualizations/simple_matmul.mp4)
+https://github.com/user-attachments/assets/1054424d-a09f-4e0d-b60b-4fbecd2527e3
+
 
 For an interactive video, play [this](../visualizations/simple_matmul.html) in your browser
+
+*Note: This visualization was generated using Gemini and may contain minor inaccuracies. Treat it as a conceptual guide rather than an exact account of the implementation.*
+
+---
 
 ## 1. Break the problem into tiles
 
