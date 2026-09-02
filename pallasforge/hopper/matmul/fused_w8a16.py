@@ -277,13 +277,13 @@ def main():
     # Realistic LLM decode shapes (M, K, N) across QKV, MLP-Gate/Up, and MLP-Down
     # M represents decode batch size (1 for single-stream, 4-16 for batched decode)
     shapes = [
-        (1, 4096, 4096),    # LLaMA-8B Single-token Attention
-        (1, 4096, 14336),   # LLaMA-8B Single-token MLP Gate/Up
-        (1, 14336, 4096),   # LLaMA-8B Single-token MLP Down
-        (4, 4096, 4096),    # LLaMA-8B Small Batched Decode
+        (1, 4096, 4096),  # LLaMA-8B Single-token Attention
+        (1, 4096, 14336),  # LLaMA-8B Single-token MLP Gate/Up
+        (1, 14336, 4096),  # LLaMA-8B Single-token MLP Down
+        (4, 4096, 4096),  # LLaMA-8B Small Batched Decode
         (16, 4096, 14336),  # LLaMA-8B Batched MLP
-        (1, 8192, 8192),    # LLaMA-70B Single-token Attention
-        (1, 8192, 28672),   # LLaMA-70B Single-token MLP Gate/Up
+        (1, 8192, 8192),  # LLaMA-70B Single-token Attention
+        (1, 8192, 28672),  # LLaMA-70B Single-token MLP Gate/Up
     ]
 
     for m, k, n in shapes:
@@ -303,7 +303,7 @@ def main():
         # BF16 tolerance: rtol=1e-2 matches 7-bit mantissa precision; atol=5e-2 covers zero-floor
         passed = jnp.allclose(ref, out, rtol=1e-2, atol=5e-2)
         print(f"Shape (M={m:<2}, K={k:<5}, N={n:<5}) -> {'PASS' if passed else 'FAIL'}")
-        
+
         assert passed, f"Kernel mismatch on shape (M={m}, K={k}, N={n})"
 
 
