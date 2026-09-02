@@ -51,3 +51,11 @@ Tutorials are provided as a reference for starters along with educational materi
 We are taking a slightly different approach to open source with this repository. Instead of building the project behind closed doors and asking for contributions later, we want to develop it *with the community* from day one. This is an open invitation to anyone who loves writing GPU kernels; whether you are a solo developer learning the ropes, or part of the core JAX-Pallas and NVIDIA JAX teams.
 
 If you want to get involved, you can find a list of planned kernels and ideas listed in the [PROPOSALS](./docs/PROPOSALS.md) document. Please take a look at the [code guidelines](./docs/GUIDELINES.md) before opening a PR. 
+
+
+## References
+
+- [JAX](https://docs.jax.dev/en/latest/101/index.html)
+- [Pallas Mosaic GPU](https://docs.jax.dev/en/latest/pallas/gpu/index.html)
+- [Tokamax](https://github.com/openxla/tokamax)
+- [tune-jax](https://github.com/rdyro/tune-jax)
