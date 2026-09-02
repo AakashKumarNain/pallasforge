@@ -7,6 +7,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from pallasforge.common import get_max_smem_bytes
+from pallasforge.common import benchmark
 
 
 def quantize_weight_per_output_channel(weight):
@@ -271,10 +272,107 @@ def matmul(
     return output[:m, :]
 
 
+def compute_memory_bandwidth_gbps(m, k, n, time_ms):
+    """Calculates effective memory bandwidth (GB/s) for W8A16 GEMM."""
+    # Bytes: Activations (BF16: 2B) + Weights (INT8: 1B) + Scales (BF16: 2B) + Output (BF16: 2B)
+    total_bytes = (m * k * 2) + (n * k * 1) + (n * 2) + (m * n * 2)
+    time_sec = time_ms / 1000.0
+    return (total_bytes / 1e9) / time_sec
+
+
+def format_relative_perf(t_kernel: float, t_ref: float) -> str:
+    """Formats relative performance as Nx faster or Nx slower."""
+    if t_kernel <= 0 or t_ref <= 0:
+        return "N/A"
+
+    if t_kernel <= t_ref:
+        factor = t_ref / t_kernel
+        return f"{factor:.2f}x faster"
+    else:
+        factor = t_kernel / t_ref
+        return f"{factor:.2f}x slower"
+
+
+def run_benchmark_and_profiling():
+    jax.config.update("jax_default_matmul_precision", "highest")
+    key = jax.random.PRNGKey(0)
+
+    scenarios = [
+        # --- LLaMA-3 8B (Hidden: 4096, Intermediate: 14336) ---
+        {"desc": "Llama-8B Gate/Up (M=1)", "m": 1, "k": 4096, "n": 14336},
+        {"desc": "Llama-8B Down (M=1)", "m": 1, "k": 14336, "n": 4096},
+        {"desc": "Llama-8B Gate/Up (M=4)", "m": 4, "k": 4096, "n": 14336},
+        {"desc": "Llama-8B Down (M=8)", "m": 8, "k": 14336, "n": 4096},
+        {"desc": "Llama-8B Gate/Up (M=16)", "m": 16, "k": 4096, "n": 14336},
+        # --- LLaMA-3 70B (Hidden: 8192, Intermediate: 28672) ---
+        {"desc": "Llama-70B QKV (M=1)", "m": 1, "k": 8192, "n": 8192},
+        {"desc": "Llama-70B Gate/Up (M=1)", "m": 1, "k": 8192, "n": 28672},
+        {"desc": "Llama-70B Down (M=1)", "m": 1, "k": 28672, "n": 8192},
+        {"desc": "Llama-70B Down (M=8)", "m": 8, "k": 28672, "n": 8192},
+        {"desc": "Llama-70B Gate/Up (M=16)", "m": 16, "k": 8192, "n": 28672},
+    ]
+
+    print("=" * 120)
+    print(
+        f"{'Workload':<24} | {'Shape (M, K, N)':<18} | {'Correct':<8} | "
+        f"{'Pallas (ms)':<12} | {'Ref (ms)':<10} | {'Relative Perf':<15} | {'Bandwidth'}"
+    )
+    print("=" * 120)
+
+    for sc in scenarios:
+        m, k, n = sc["m"], sc["k"], sc["n"]
+        k_act, k_w, key = jax.random.split(key, 3)
+
+        # 1. Inputs generation
+        act = (jax.random.normal(k_act, (m, k)) * 0.1).astype(jnp.bfloat16)
+        raw_w = jax.random.normal(k_w, (n, k), dtype=jnp.float32) * 0.05
+        weights, scale = quantize_weight_per_output_channel(raw_w)
+
+        # 2. Correctness validation
+        ref_out = simple_w8a16_matmul(weights, scale, act)
+        kernel_out = matmul(act, weights, scale)
+        is_correct = jnp.allclose(ref_out, kernel_out, rtol=1e-2, atol=5e-2)
+
+        # 3. CUPTI Measurements
+        pallas_report = benchmark(
+            matmul,
+            args=(act, weights, scale),
+            warmup=5,
+            iterations=15,
+        )
+
+        ref_report = benchmark(
+            simple_w8a16_matmul,
+            args=(weights, scale, act),
+            warmup=5,
+            iterations=15,
+        )
+
+        t_pallas = pallas_report.median_kernel_time_ms
+        t_ref = ref_report.median_kernel_time_ms
+
+        # Explicit fast vs slow calculation
+        perf_str = format_relative_perf(t_pallas, t_ref)
+        bw_gbps = compute_memory_bandwidth_gbps(m, k, n, t_pallas)
+
+        shape_str = f"({m}, {k}, {n})"
+        status_str = "Pass" if is_correct else "Fail"
+        bw_str = (
+            f"{bw_gbps / 1000.0:.2f} TB/s" if bw_gbps >= 1000 else f"{bw_gbps:.1f} GB/s"
+        )
+
+        print(
+            f"{sc['desc']:<24} | {shape_str:<18} | {status_str:<8} | "
+            f"{t_pallas:<12.4f} | {t_ref:<10.4f} | {perf_str:<15} | {bw_str}"
+        )
+
+    print("=" * 120)
+
+
 def main():
     key = jax.random.PRNGKey(0)
 
-    # Realistic LLM decode shapes (M, K, N) across QKV, MLP-Gate/Up, and MLP-Down
+    # LLM decode shapes (M, K, N) across QKV, MLP-Gate/Up, and MLP-Down
     # M represents decode batch size (1 for single-stream, 4-16 for batched decode)
     shapes = [
         (1, 4096, 4096),  # LLaMA-8B Single-token Attention
@@ -302,10 +400,11 @@ def main():
 
         # BF16 tolerance: rtol=1e-2 matches 7-bit mantissa precision; atol=5e-2 covers zero-floor
         passed = jnp.allclose(ref, out, rtol=1e-2, atol=5e-2)
-        print(f"Shape (M={m:<2}, K={k:<5}, N={n:<5}) -> {'PASS' if passed else 'FAIL'}")
+        print(f"Shape (M={m:<2}, K={k:<5}, N={n:<5}) : {'Pass' if passed else 'Fail'}")
 
         assert passed, f"Kernel mismatch on shape (M={m}, K={k}, N={n})"
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    run_benchmark_and_profiling()
