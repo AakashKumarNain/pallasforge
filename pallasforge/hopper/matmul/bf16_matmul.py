@@ -11,7 +11,7 @@ from jax.extend import backend
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from pallasforge.utils import get_max_smem_bytes
+from pallasforge.common import get_max_smem_bytes
 
 
 def matmul(

@@ -6,8 +6,7 @@ from jax.extend import backend
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from pallasforge.utils import get_max_smem_bytes
-
+from pallasforge.common import get_max_smem_bytes
 
 
 def quantize_weight_per_output_channel(weight):
@@ -28,16 +27,16 @@ def simple_w8a16_matmul(quantized_weights, weight_scale, activations):
 
 
 def matmul(
-        activations,
-        weights,
-        scale,
-        tile_m=64,
-        tile_n=64,
-        tile_k=128,
-        num_pipeline_stages=5,
-        panel_width=4,
-        is_persistent=False
-    ):
+    activations,
+    weights,
+    scale,
+    tile_m=64,
+    tile_n=64,
+    tile_k=128,
+    num_pipeline_stages=5,
+    panel_width=4,
+    is_persistent=False,
+):
     m, k = activations.shape
     n, k_weight = weights.shape
 
@@ -62,23 +61,31 @@ def matmul(
     total_tiles_mn = num_tiles_m * num_tiles_n
 
     # GPU Transforms or the layouts (WGMMA Hopper swizzles)
-    activation_transforms = (plgpu.TilingTransform((8, 64)), plgpu.SwizzleTransform(128))
-    weight_transforms     = (plgpu.TilingTransform((8, 128)), plgpu.SwizzleTransform(128))
-    output_transforms     = (plgpu.TilingTransform((1, 64)), plgpu.SwizzleTransform(128),)
+    activation_transforms = (
+        plgpu.TilingTransform((8, 64)),
+        plgpu.SwizzleTransform(128),
+    )
+    weight_transforms = (plgpu.TilingTransform((8, 128)), plgpu.SwizzleTransform(128))
+    output_transforms = (
+        plgpu.TilingTransform((1, 64)),
+        plgpu.SwizzleTransform(128),
+    )
 
     # Shared Memory (SMEM) allocation sizing
     activation_stage_bytes = tile_m * tile_k * activations_bytes_per_elem
-    weight_stage_bytes     = tile_n * tile_k * weights_bytes_per_elem
+    weight_stage_bytes = tile_n * tile_k * weights_bytes_per_elem
 
-    input_smem_bytes = num_pipeline_stages * (activation_stage_bytes + weight_stage_bytes)
-    out_smem_bytes   = tile_m * tile_n * out_bytes_per_elem
-    max_smem_bytes   = get_max_smem_bytes()
+    input_smem_bytes = num_pipeline_stages * (
+        activation_stage_bytes + weight_stage_bytes
+    )
+    out_smem_bytes = tile_m * tile_n * out_bytes_per_elem
+    max_smem_bytes = get_max_smem_bytes()
 
     # Register allocation sizing per thread
     acc_reg_per_thread = tile_m * tile_n // num_warpgroup_threads
 
     if max_smem_bytes is None:
-            raise ValueError("Unable to find out max shared memory size for this GPU!")
+        raise ValueError("Unable to find out max shared memory size for this GPU!")
     if input_smem_bytes + out_smem_bytes > max_smem_bytes:
         raise ValueError(
             "The current configuration exceeds the total available shared memory!"
@@ -134,21 +141,24 @@ def matmul(
                     )
 
                     # Int8 -> Bf16 dequantization happens only inside the kernel
-                    weight_fragment = plgpu.layout_cast(weight_fragment, plgpu.Layout.WGMMA).astype(jnp.bfloat16)
+                    weight_fragment = plgpu.layout_cast(
+                        weight_fragment, plgpu.Layout.WGMMA
+                    ).astype(jnp.bfloat16)
                     # Apply per channel scale to these weights now
-                    weight_fragment *= jax.lax.broadcast_in_dim(weight_scale, weight_fragment.shape, (0,))
+                    weight_fragment *= jax.lax.broadcast_in_dim(
+                        weight_scale, weight_fragment.shape, (0,)
+                    )
 
                     # Compute [tile_n, tile_k] @ [tile_k, tile_m]
                     #               weight          activation
                     plgpu.wgmma(acc, weight_fragment, activation_smem.T)
                     plgpu.wgmma_wait(1)
 
-
                 tile_spec = partial(plgpu.BlockSpec, delay_release=1)
                 activation_tile_spec = tile_spec(
                     (tile_m, tile_k),
                     lambda k_idx: (row_idx, k_idx),
-                    transforms=activation_transforms
+                    transforms=activation_transforms,
                 )
                 weight_tile_spec = tile_spec(
                     (tile_n, tile_k),
@@ -185,6 +195,7 @@ def matmul(
 
         # Grid Dispatch: Persistent Worker Loop vs. 1-to-1 Threadblock Launch
         if is_persistent:
+
             def persistent_loop_body(loop_info):
                 (tile_idx,) = loop_info.index
                 compute_one_output_tile(tile_idx)
@@ -193,7 +204,6 @@ def matmul(
         else:
             tile_idx = jax.lax.axis_index("out_tile")
             compute_one_output_tile(tile_idx)
-
 
     if is_persistent:
         launch_grid = (backend.get_default_device().core_count,)
@@ -220,5 +230,3 @@ def matmul(
         ),
     )(padded_activations, weights, scale)
     return output[:m, :]
-
-

@@ -4,10 +4,11 @@ import shutil
 import tempfile
 import dataclasses
 from contextlib import contextmanager
-from typing import Any, Callable, Sequence, Iterator
+from typing import Any, Callable, Sequence
 
 import jax
 import jax.numpy as jnp
+from jax.extend import backend
 from jax.experimental.mosaic.gpu import profiler
 from xprof.cli.tools import get_kernel_stats_tool
 
@@ -43,6 +44,13 @@ class BenchmarkReport:
         print(f"Compilation Time    :  {self.compile_time_ms:.3f} ms")
         print(f"Peak Device Memory  :  {self.peak_memory_mb:.2f} MB")
         print(f"Median Kernel Time  :  {self.median_kernel_time_ms:.4f} ms")
+
+
+def get_max_smem_bytes():
+    """Get the maximum available shared memory on a single device!"""
+    gpu = backend.get_default_device()
+    smem_bytes = getattr(gpu, "shared_memory_per_block_optin", None)
+    return int(smem_bytes) if smem_bytes else None
 
 
 def benchmark(
