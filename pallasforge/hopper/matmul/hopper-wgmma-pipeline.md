@@ -57,4 +57,14 @@ After all K steps are complete, the kernel enters its final stage. It converts t
 
 That buffer uses `SwizzleTransform(128)`, which lays out the values to reduce shared-memory bank conflicts. The kernel commits the shared-memory writes, starts an asynchronous copy to the correct output slice in HBM, and waits for that copy to finish before it reuses the buffer.
 
-That is the full pattern: tile the matrices, visit the tiles in an order that encourages reuse, overlap memory traffic with Tensor Core work, keep the running sum in registers, and write the finished tile back only once. The arithmetic matters, but on a GPU, moving data well is what keeps the arithmetic moving.
+---
+
+<br>
+
+To sumarize, this is the full pattern:
+
+    - tile the matrices
+    - visit the tiles in an order that encourages reuse
+    - overlap memory traffic with Tensor Core work
+    - keep the running sum in registers, and
+    - write the finished tile back only once.
