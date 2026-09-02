@@ -6,23 +6,24 @@
 <title>Hopper WGMMA Matmul Pipeline (Pallas-JAX)</title>
 <style>
   :root {
-    --bg-color: #0b0f19;
-    --card-bg: #111827;
-    --border-color: #1e293b;
-    --lhs-color: #38bdf8;
-    --rhs-color: #34d399;
-    --out-color: #fbbf24;
-    --smem-color: #c084fc;
-    --text-main: #f8fafc;
-    --text-dim: #94a3b8;
-    --accent: #6366f1;
+    --bg-color: #050706;
+    --card-bg: #0b0e0d;
+    --border-color: #293231;
+    --lhs-color: #6FAEA2;
+    --rhs-color: #8FA677;
+    --out-color: #C7B37B;
+    --smem-color: #C98B78;
+    --text-main: #E0DDD4;
+    --text-dim: #8E9890;
+    --accent: #7A8A83;
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    background-color: var(--bg-color);
+    background: radial-gradient(circle at top, #0a0d0d 0%, var(--bg-color) 58%);
     color: var(--text-main);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Helvetica, Arial, sans-serif;
+    letter-spacing: 0.01em;
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -38,8 +39,8 @@
     max-width: 98vw;
     background: var(--card-bg);
     border: 1px solid var(--border-color);
-    border-radius: 14px;
-    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7);
+    border-radius: 18px;
+    box-shadow: 0 22px 42px -18px rgba(0, 0, 0, 0.42);
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -52,7 +53,7 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
-    background: #0f172a;
+    background: #0a0d0d;
   }
   .header-left {
     display: flex;
@@ -60,25 +61,27 @@
     gap: 12px;
   }
   .header h1 {
-    font-size: 1.15rem;
-    font-weight: 600;
+    font-size: 1.18rem;
+    font-weight: 500;
     color: var(--text-main);
-    letter-spacing: -0.01em;
+    letter-spacing: 0.01em;
+    font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
   }
   .badge {
-    background: rgba(56, 189, 248, 0.12);
+    background: rgba(111, 174, 162, 0.10);
     color: var(--lhs-color);
-    border: 1px solid rgba(56, 189, 248, 0.3);
+    border: 1px solid rgba(111, 174, 162, 0.24);
     padding: 3px 9px;
     border-radius: 6px;
     font-size: 0.75rem;
-    font-weight: 700;
+    font-weight: 600;
     letter-spacing: 0.05em;
   }
   .act-indicator {
     font-size: 0.88rem;
     color: var(--out-color);
-    font-weight: 600;
+    font-weight: 500;
+    font-style: italic;
   }
 
   /* Canvas viewport */
@@ -86,7 +89,7 @@
     position: relative;
     width: 100%;
     height: 530px;
-    background: #090d16;
+    background: #040505;
   }
   canvas {
     width: 100%;
@@ -97,7 +100,7 @@
   /* Bottom Controls & Intuition Subtitle Bar */
   .footer {
     padding: 14px 24px;
-    background: #0f172a;
+    background: #0a0d0d;
     border-top: 1px solid var(--border-color);
     display: flex;
     flex-direction: column;
@@ -105,20 +108,20 @@
   }
 
   .subtitle-bar {
-    background: #1e293b;
-    border-left: 4px solid var(--out-color);
+    background: #293231;
+    border-left: 3px solid var(--out-color);
     padding: 10px 16px;
     border-radius: 6px;
     font-size: 0.88rem;
     line-height: 1.5;
-    color: #e2e8f0;
+    color: #D6D4CB;
     min-height: 48px;
     display: flex;
     align-items: center;
   }
   .subtitle-bar code {
     background: rgba(0,0,0,0.3);
-    color: #38bdf8;
+    color: #6FAEA2;
     padding: 2px 6px;
     border-radius: 4px;
     font-family: ui-monospace, monospace;
@@ -137,12 +140,12 @@
   }
 
   .icon-btn {
-    background: #1e293b;
-    border: 1px solid #334155;
+    background: #293231;
+    border: 1px solid #3A4543;
     color: var(--text-main);
     width: 36px;
     height: 36px;
-    border-radius: 8px;
+    border-radius: 10px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -150,8 +153,8 @@
     transition: all 0.15s ease;
   }
   .icon-btn:hover {
-    background: #334155;
-    border-color: #475569;
+    background: #3A4543;
+    border-color: #556260;
     transform: translateY(-1px);
   }
   .icon-btn svg {
@@ -170,7 +173,7 @@
     flex: 1;
     height: 6px;
     accent-color: var(--out-color);
-    background: #334155;
+    background: #3A4543;
     border-radius: 3px;
     cursor: pointer;
     outline: none;
@@ -190,8 +193,8 @@
   .tab-btn {
     font-size: 0.75rem;
     padding: 6px 12px;
-    background: #1e293b;
-    border: 1px solid #334155;
+    background: #293231;
+    border: 1px solid #3A4543;
     border-radius: 6px;
     color: var(--text-dim);
     font-weight: 600;
@@ -199,29 +202,29 @@
     transition: all 0.15s ease;
   }
   .tab-btn:hover {
-    background: #283548;
+    background: #323c3a;
     color: var(--text-main);
   }
   .tab-btn.active {
-    background: rgba(251, 191, 36, 0.15);
+    background: rgba(199, 179, 123, 0.14);
     border-color: var(--out-color);
     color: var(--out-color);
   }
 
   #speedBtn {
-    background: #1e293b;
-    border: 1px solid #334155;
+    background: #293231;
+    border: 1px solid #3A4543;
     color: var(--text-main);
     padding: 0 10px;
     height: 36px;
-    border-radius: 8px;
+    border-radius: 10px;
     font-size: 0.82rem;
     font-weight: 700;
     cursor: pointer;
     min-width: 52px;
   }
   #speedBtn:hover {
-    background: #334155;
+    background: #3A4543;
   }
 </style>
 </head>
@@ -404,11 +407,11 @@ function renderAct1(t) {
   actIndicator.innerText = "Act 1: Global Problem & 2D Tiling";
   subtitleText.innerHTML = `<span><b>2D Matrix Tiling:</b> Large matrices <code>LHS (M×K)</code> and <code>RHS (K×N)</code> are sliced into atomic tiles (<code>64×128</code> and <code>128×128</code>). Each tile is computed in SMEM & accumulator registers.</span>`;
 
-  drawMatrixBox(80, 95, 170, 240, "#38bdf8", "LHS (M × K)", "bfloat16");
-  drawMatrixBox(300, 65, 250, 160, "#34d399", "RHS (K × N)", "bfloat16");
-  drawMatrixBox(300, 255, 250, 240, "#fbbf24", "Output (M × N)", "Accumulated Result");
+  drawMatrixBox(80, 95, 170, 240, "#6FAEA2", "LHS (M × K)", "bfloat16");
+  drawMatrixBox(300, 65, 250, 160, "#8FA677", "RHS (K × N)", "bfloat16");
+  drawMatrixBox(300, 255, 250, 240, "#C7B37B", "Output (M × N)", "Accumulated Result");
 
-  ctx.fillStyle = "#64748b";
+  ctx.fillStyle = "#73807A";
   ctx.font = "bold 26px sans-serif";
   ctx.fillText("×", 265, 185);
   ctx.fillText("=", 265, 375);
@@ -432,18 +435,18 @@ function renderAct1(t) {
     const pulse = 0.6 + 0.4 * Math.sin(t * 6);
     ctx.fillStyle = `rgba(251, 191, 36, ${0.45 * pulse})`;
     ctx.fillRect(300 + 83.3, 255 + 60, 83.3, 60);
-    ctx.strokeStyle = "#fbbf24";
-    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = "#C7B37B";
+    ctx.lineWidth = 2.0;
     ctx.strokeRect(300 + 83.3, 255 + 60, 83.3, 60);
 
-    ctx.fillStyle = `rgba(56, 189, 248, 0.35)`;
+    ctx.fillStyle = `rgba(111, 174, 162, 0.18)`;
     ctx.fillRect(80, 95 + 60, 170, 60);
-    ctx.strokeStyle = "#38bdf8";
+    ctx.strokeStyle = "#6FAEA2";
     ctx.strokeRect(80, 95 + 60, 170, 60);
 
-    ctx.fillStyle = `rgba(52, 211, 153, 0.35)`;
+    ctx.fillStyle = `rgba(143, 166, 119, 0.18)`;
     ctx.fillRect(300 + 83.3, 65, 83.3, 160);
-    ctx.strokeStyle = "#34d399";
+    ctx.strokeStyle = "#8FA677";
     ctx.strokeRect(300 + 83.3, 65, 83.3, 160);
 
     drawCard(610, 100, 490, 300, "Hopper Tile Dimensions", [
@@ -471,7 +474,7 @@ function renderAct2(t) {
   const startX = 80, startY = 110;
   const panelWidth = 4;
 
-  ctx.fillStyle = "#94a3b8";
+  ctx.fillStyle = "#8E9890";
   ctx.font = "bold 13px sans-serif";
   ctx.fillText("Output Matrix Tile Grid (M/tile_m × N/tile_n)", startX, startY - 18);
 
@@ -479,8 +482,8 @@ function renderAct2(t) {
     for (let c = 0; c < cols; c++) {
       const x = startX + c * (cellW + 5);
       const y = startY + r * (cellH + 5);
-      ctx.fillStyle = "#131b2e";
-      ctx.strokeStyle = "#27354a";
+      ctx.fillStyle = "#0f1312";
+      ctx.strokeStyle = "#2f3937";
       ctx.lineWidth = 1;
       drawRoundedRect(x, y, cellW, cellH, 4, true, true);
     }
@@ -489,11 +492,11 @@ function renderAct2(t) {
   // Panel 0 border
   const p0Width = panelWidth * (cellW + 5) - 5;
   const p0Height = rows * (cellH + 5) - 5;
-  ctx.strokeStyle = "#38bdf8";
-  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = "#6FAEA2";
+  ctx.lineWidth = 2.0;
   drawRoundedRect(startX - 4, startY - 4, p0Width + 8, p0Height + 8, 6, false, true);
 
-  ctx.fillStyle = "#38bdf8";
+  ctx.fillStyle = "#6FAEA2";
   ctx.font = "bold 12px sans-serif";
   ctx.fillText("Panel 0 (panel_width = 4)", startX, startY + p0Height + 22);
 
@@ -514,17 +517,17 @@ function renderAct2(t) {
     const y = startY + pt.r * (cellH + 5);
     const isLatest = i === pathCoords.length - 1;
 
-    ctx.fillStyle = isLatest ? "#fbbf24" : "rgba(251, 191, 36, 0.4)";
+    ctx.fillStyle = isLatest ? "#C7B37B" : "rgba(199, 179, 123, 0.22)";
     drawRoundedRect(x, y, cellW, cellH, 4, true, false);
 
-    ctx.fillStyle = isLatest ? "#000" : "#fff";
+    ctx.fillStyle = isLatest ? "#050706" : "#E0DDD4";
     ctx.font = "bold 11px sans-serif";
     ctx.fillText(pt.idx, x + cellW/2 - 6, y + cellH/2 + 4);
   });
 
   if (pathCoords.length > 1) {
-    ctx.strokeStyle = "#fbbf24";
-    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = "#C7B37B";
+    ctx.lineWidth = 2.0;
     ctx.beginPath();
     pathCoords.forEach((pt, i) => {
       const x = startX + pt.c * (cellW + 5) + cellW/2;
@@ -550,7 +553,7 @@ function renderAct2(t) {
   ]);
 
   const cacheHit = isTurnaround ? 98 : 78 + Math.sin(t * 3) * 8;
-  drawMeter(535, 400, 545, 22, "L2 Cache Hit Rate", cacheHit, cacheHit > 90 ? "#34d399" : "#38bdf8");
+  drawMeter(535, 400, 545, 22, "L2 Cache Hit Rate", cacheHit, cacheHit > 90 ? "#8FA677" : "#6FAEA2");
 }
 
 // -------------------------------------------------------------
@@ -561,13 +564,16 @@ function renderAct3(t) {
   subtitleText.innerHTML = `<span><b>Async TMA & WGMMA:</b> GMEM fetches take ~400 cycles. We stage 4 circular buffers in SMEM. While Tensor Cores multiply stage <code>k</code>, asynchronous hardware loads stage <code>k+3</code>.</span>`;
 
   const stages = 4;
-  const cycleTime = 4.0;
-  const stepIdx = Math.floor(t / cycleTime);
+  const reductionSteps = 32;
+  // Act 3 lasts 20s (28s–48s). Advance through all 32 K-reduction
+  // steps so the pipeline is fully drained before the writeback act begins.
+  const cycleTime = 20.0 / reductionSteps;
+  const stepIdx = Math.min(reductionSteps - 1, Math.floor(t / cycleTime));
   const localT = (t % cycleTime) / cycleTime;
 
-  drawMemoryTier(60, 75, 1060, 48, "#38bdf8", "Global Memory / HBM (High Latency ~400 cycles) — Asynchronous TMA Transfers");
+  drawMemoryTier(60, 75, 1060, 48, "#6FAEA2", "Global Memory / HBM (High Latency ~400 cycles) — Asynchronous TMA Transfers");
 
-  ctx.fillStyle = "#94a3b8";
+  ctx.fillStyle = "#8E9890";
   ctx.font = "bold 13px sans-serif";
   ctx.fillText("Shared Memory (SMEM) — 4 Concurrent Pipeline Stages", 60, 160);
 
@@ -575,20 +581,26 @@ function renderAct3(t) {
   for (let s = 0; s < stages; s++) {
     const x = 60 + s * (slotW + 26);
     const y = 175;
-    const isComputing = (s === (stepIdx % stages));
-    const isFetching = (s === ((stepIdx + 3) % stages));
+    // Map each physical circular-buffer slot to its current logical K step.
+    // Example at stepIdx=1: slot 1 -> k=1 (compute), slot 2 -> k=2,
+    // slot 3 -> k=3, slot 0 -> k=4 (the look-ahead fetch).
+    const slotOffset = (s - (stepIdx % stages) + stages) % stages;
+    const logicalK = stepIdx + slotOffset;
+    const hasWork = logicalK < reductionSteps;
+    const isComputing = hasWork && logicalK === stepIdx;
+    const isFetching = hasWork && logicalK === stepIdx + (stages - 1);
 
-    let borderColor = "#334155";
-    let bgColor = "#131b2e";
-    let status = "BUFFERED / READY";
+    let borderColor = "#3A4543";
+    let bgColor = "#0f1312";
+    let status = hasWork ? "BUFFERED / READY" : "EMPTY / DRAINED";
 
     if (isComputing) {
-      borderColor = "#fbbf24";
-      bgColor = "rgba(251, 191, 36, 0.12)";
+      borderColor = "#C7B37B";
+      bgColor = "rgba(199, 179, 123, 0.10)";
       status = "WGMMA COMPUTE";
     } else if (isFetching) {
-      borderColor = "#38bdf8";
-      bgColor = "rgba(56, 189, 248, 0.12)";
+      borderColor = "#6FAEA2";
+      bgColor = "rgba(111, 174, 162, 0.10)";
       status = "ASYNC GMEM LOAD";
     }
 
@@ -599,9 +611,9 @@ function renderAct3(t) {
 
     ctx.fillStyle = borderColor;
     ctx.font = "bold 13px sans-serif";
-    ctx.fillText(`Stage Slot ${s} (k=${stepIdx + s})`, x + 16, y + 24);
+    ctx.fillText(hasWork ? `Stage Slot ${s} (k=${logicalK})` : `Stage Slot ${s} (drained)`, x + 16, y + 24);
 
-    ctx.fillStyle = "#cbd5e1";
+    ctx.fillStyle = "#C5C8BD";
     ctx.font = "12px sans-serif";
     ctx.fillText(`LHS: (64×128) bf16`, x + 16, y + 48);
     ctx.fillText(`RHS: (128×128) bf16`, x + 16, y + 68);
@@ -612,32 +624,32 @@ function renderAct3(t) {
 
     if (isFetching) {
       const flowY = y + 8 + localT * (slotH - 16);
-      ctx.fillStyle = "#38bdf8";
+      ctx.fillStyle = "#6FAEA2";
       ctx.beginPath();
-      ctx.arc(x + slotW/2, flowY, 5, 0, Math.PI * 2);
+      ctx.arc(x + slotW/2, flowY, 4.5, 0, Math.PI * 2);
       ctx.fill();
     }
   }
 
   const accX = 310, accY = 320, accW = 560, accH = 80;
-  ctx.fillStyle = "rgba(251, 191, 36, 0.08)";
-  ctx.strokeStyle = "#fbbf24";
-  ctx.lineWidth = 2.5;
+  ctx.fillStyle = "rgba(199, 179, 123, 0.07)";
+  ctx.strokeStyle = "#C7B37B";
+  ctx.lineWidth = 2.0;
   drawRoundedRect(accX, accY, accW, accH, 8, true, true);
 
-  ctx.fillStyle = "#fbbf24";
+  ctx.fillStyle = "#C7B37B";
   ctx.font = "bold 15px sans-serif";
   ctx.fillText("Hopper Tensor Cores (plgpu.wgmma)", accX + 22, accY + 30);
-  ctx.fillStyle = "#f8fafc";
+  ctx.fillStyle = "#E0DDD4";
   ctx.font = "13px ui-monospace, monospace";
   ctx.fillText("acc[64, 128] += lhs_smem @ rhs_smem (FP32 Accumulator)", accX + 22, accY + 56);
 
   const activeComputeSlotX = 60 + (stepIdx % stages) * (slotW + 26) + slotW/2;
-  drawArrow(activeComputeSlotX, 275, accX + accW/2, accY, "#fbbf24");
+  drawArrow(activeComputeSlotX, 275, accX + accW/2, accY, "#C7B37B");
 
-  ctx.fillStyle = "#94a3b8";
+  ctx.fillStyle = "#8E9890";
   ctx.font = "12px ui-monospace, monospace";
-  ctx.fillText(`Reduction Step: ${stepIdx + 1} / 32  |  Pipeline Latency Hidden: 100% (Compute-Bound Overlap)`, 60, 445);
+  ctx.fillText(`Reduction Step: ${stepIdx + 1} / ${reductionSteps}  |  4-stage TMA/WGMMA overlap`, 60, 445);
 }
 
 // -------------------------------------------------------------
@@ -651,15 +663,15 @@ function renderAct4(t) {
 
   // Box 1: FP32 Accumulator Registers
   const rX = 60, rY = 115, rW = 270, rH = 155;
-  ctx.fillStyle = "#131b2e";
-  ctx.strokeStyle = "#fbbf24";
-  ctx.lineWidth = 2.5;
+  ctx.fillStyle = "#0f1312";
+  ctx.strokeStyle = "#C7B37B";
+  ctx.lineWidth = 2.0;
   drawRoundedRect(rX, rY, rW, rH, 10, true, true);
   
-  ctx.fillStyle = "#fbbf24";
+  ctx.fillStyle = "#C7B37B";
   ctx.font = "bold 15px sans-serif";
   ctx.fillText("Accumulator Registers", rX + 18, rY + 32);
-  ctx.fillStyle = "#cbd5e1";
+  ctx.fillStyle = "#C5C8BD";
   ctx.font = "13px sans-serif";
   ctx.fillText("• Precision: float32", rX + 18, rY + 65);
   ctx.fillText("• Shape: (tile_m, tile_n)", rX + 18, rY + 92);
@@ -671,8 +683,8 @@ function renderAct4(t) {
   const arrow1EndX = 455;
   const arrow1Y = rY + rH/2;
   
-  drawArrow(arrow1StartX, arrow1Y, arrow1EndX, arrow1Y, isCast ? "#c084fc" : "#475569");
-  ctx.fillStyle = isCast ? "#e9d5ff" : "#64748b";
+  drawArrow(arrow1StartX, arrow1Y, arrow1EndX, arrow1Y, isCast ? "#C98B78" : "#556260");
+  ctx.fillStyle = isCast ? "#E2C7BE" : "#73807A";
   ctx.font = "bold 12px ui-monospace, monospace";
   ctx.textAlign = "center";
   ctx.fillText(".astype(bf16)", (arrow1StartX + arrow1EndX) / 2, arrow1Y - 12);
@@ -680,15 +692,15 @@ function renderAct4(t) {
 
   // Box 2: Shared Memory (out_smem)
   const smemX = 455, smemY = 115, smemW = 270, smemH = 155;
-  ctx.fillStyle = isCast ? "rgba(192, 132, 252, 0.12)" : "#131b2e";
-  ctx.strokeStyle = isCast ? "#c084fc" : "#334155";
-  ctx.lineWidth = 2.5;
+  ctx.fillStyle = isCast ? "rgba(201, 139, 120, 0.10)" : "#0f1312";
+  ctx.strokeStyle = isCast ? "#C98B78" : "#3A4543";
+  ctx.lineWidth = 2.0;
   drawRoundedRect(smemX, smemY, smemW, smemH, 10, true, true);
   
-  ctx.fillStyle = "#c084fc";
+  ctx.fillStyle = "#C98B78";
   ctx.font = "bold 15px sans-serif";
   ctx.fillText("out_smem (Shared Mem)", smemX + 18, smemY + 32);
-  ctx.fillStyle = "#cbd5e1";
+  ctx.fillStyle = "#C5C8BD";
   ctx.font = "13px sans-serif";
   ctx.fillText("• Type: bfloat16 (2 bytes)", smemX + 18, smemY + 65);
   ctx.fillText("• SwizzleTransform(128)", smemX + 18, smemY + 92);
@@ -700,8 +712,8 @@ function renderAct4(t) {
   const arrow2EndX = 850;
   const arrow2Y = smemY + smemH/2;
   
-  drawArrow(arrow2StartX, arrow2Y, arrow2EndX, arrow2Y, isWritten ? "#34d399" : "#475569");
-  ctx.fillStyle = isWritten ? "#a7f3d0" : "#64748b";
+  drawArrow(arrow2StartX, arrow2Y, arrow2EndX, arrow2Y, isWritten ? "#8FA677" : "#556260");
+  ctx.fillStyle = isWritten ? "#C7D7BC" : "#73807A";
   ctx.font = "bold 12px ui-monospace, monospace";
   ctx.textAlign = "center";
   ctx.fillText("copy_to_gmem()", (arrow2StartX + arrow2EndX) / 2, arrow2Y - 12);
@@ -709,15 +721,15 @@ function renderAct4(t) {
 
   // Box 3: Global Memory Output (out_gmem)
   const gmemX = 850, gmemY = 115, gmemW = 270, gmemH = 155;
-  ctx.fillStyle = isWritten ? "rgba(52, 211, 153, 0.12)" : "#131b2e";
-  ctx.strokeStyle = isWritten ? "#34d399" : "#334155";
-  ctx.lineWidth = 2.5;
+  ctx.fillStyle = isWritten ? "rgba(143, 166, 119, 0.10)" : "#0f1312";
+  ctx.strokeStyle = isWritten ? "#8FA677" : "#3A4543";
+  ctx.lineWidth = 2.0;
   drawRoundedRect(gmemX, gmemY, gmemW, gmemH, 10, true, true);
   
-  ctx.fillStyle = "#34d399";
+  ctx.fillStyle = "#8FA677";
   ctx.font = "bold 15px sans-serif";
   ctx.fillText("out_gmem (HBM Slice)", gmemX + 18, gmemY + 32);
-  ctx.fillStyle = "#cbd5e1";
+  ctx.fillStyle = "#C5C8BD";
   ctx.font = "13px sans-serif";
   ctx.fillText("• Slice: [row_idx, col_idx]", gmemX + 18, gmemY + 65);
   ctx.fillText("• wait_smem_to_gmem()", gmemX + 18, gmemY + 92);
@@ -735,31 +747,31 @@ function renderAct4(t) {
 // Drawing Primitives
 // -------------------------------------------------------------
 function drawMatrixBox(x, y, w, h, color, title, subtitle) {
-  ctx.fillStyle = "rgba(19, 27, 46, 0.8)";
+  ctx.fillStyle = "rgba(15, 19, 18, 0.78)";
   ctx.strokeStyle = color;
-  ctx.lineWidth = 2;
+  ctx.lineWidth = 1.8;
   drawRoundedRect(x, y, w, h, 8, true, true);
 
   ctx.fillStyle = color;
   ctx.font = "bold 14px sans-serif";
   ctx.fillText(title, x + 16, y + 28);
 
-  ctx.fillStyle = "#94a3b8";
+  ctx.fillStyle = "#8E9890";
   ctx.font = "12px sans-serif";
   ctx.fillText(subtitle, x + 16, y + 48);
 }
 
 function drawCard(x, y, w, h, title, lines) {
-  ctx.fillStyle = "#131b2e";
-  ctx.strokeStyle = "#334155";
+  ctx.fillStyle = "#0f1312";
+  ctx.strokeStyle = "#3A4543";
   ctx.lineWidth = 1.5;
   drawRoundedRect(x, y, w, h, 8, true, true);
 
-  ctx.fillStyle = "#fbbf24";
+  ctx.fillStyle = "#C7B37B";
   ctx.font = "bold 14px sans-serif";
   ctx.fillText(title, x + 20, y + 30);
 
-  ctx.fillStyle = "#cbd5e1";
+  ctx.fillStyle = "#C5C8BD";
   ctx.font = "13px sans-serif";
   
   let currentY = y + 58;
@@ -775,25 +787,25 @@ function drawCard(x, y, w, h, title, lines) {
 }
 
 function drawMeter(x, y, w, h, label, val, color) {
-  ctx.fillStyle = "#e2e8f0";
+  ctx.fillStyle = "#D6D4CB";
   ctx.font = "bold 12px sans-serif";
   ctx.fillText(`${label}: ${val.toFixed(0)}%`, x, y - 8);
 
-  ctx.fillStyle = "#0f172a";
+  ctx.fillStyle = "#0a0d0d";
   drawRoundedRect(x, y, w, h, 4, true, false);
 
   ctx.fillStyle = color;
   drawRoundedRect(x, y, (w * val) / 100, h, 4, true, false);
-  ctx.strokeStyle = "#334155";
+  ctx.strokeStyle = "#3A4543";
   drawRoundedRect(x, y, w, h, 4, false, true);
 }
 
 function drawMemoryTier(x, y, w, h, color, title) {
-  ctx.fillStyle = "#131b2e";
+  ctx.fillStyle = "#0f1312";
   ctx.strokeStyle = color;
   ctx.lineWidth = 1.5;
   drawRoundedRect(x, y, w, h, 6, true, true);
-  ctx.fillStyle = "#cbd5e1";
+  ctx.fillStyle = "#C5C8BD";
   ctx.font = "bold 13px sans-serif";
   ctx.fillText(title, x + 20, y + 30);
 }
@@ -805,14 +817,14 @@ function drawLine(x1, y1, x2, y2) {
   ctx.stroke();
 }
 
-function drawArrow(x1, y1, x2, y2, color = "#fbbf24") {
+function drawArrow(x1, y1, x2, y2, color = "#C7B37B") {
   const headlen = 9;
   const dx = x2 - x1;
   const dy = y2 - y1;
   const angle = Math.atan2(dy, dx);
   ctx.strokeStyle = color;
   ctx.fillStyle = color;
-  ctx.lineWidth = 2.5;
+  ctx.lineWidth = 2.0;
   ctx.beginPath();
   ctx.moveTo(x1, y1);
   ctx.lineTo(x2, y2);
