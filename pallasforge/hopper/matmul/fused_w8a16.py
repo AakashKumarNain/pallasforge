@@ -22,8 +22,8 @@ def quantize_weight_per_output_channel(weight):
 
 def simple_w8a16_matmul(quantized_weights, weight_scale, activations):
     """Performs W8A16 op with INT8 -> BF16 weight dequantization."""
-    dequnatized = quantized_weights.astype(jnp.bfloat16) * weight_scale[:, None]
-    return jnp.matmul(dequnatized, activations)  # Shape error: (N, K) @ (M, K)
+    dequantized = quantized_weight.astype(jnp.bfloat16) * weight_scale[:, None]
+    return jnp.matmul(activations, dequantized.T)
 
 
 def matmul(
@@ -59,6 +59,33 @@ def matmul(
     num_tiles_n = n // tile_n
     num_tiles_k = k // tile_k
     total_tiles_mn = num_tiles_m * num_tiles_n
+    
+    # Some validations
+    if activations.dtype != jnp.bfloat16:
+        raise ValueError("Activations must be of dtype `jnp.bfloat16`")
+    if quantized_weight.dtype != jnp.int8:
+        raise ValueError("Quantized weights must be of dtype `jnp.int8`")
+    if weight_scale.dtype != jnp.bfloat16:
+        raise ValueError("Weight scales must be of dtype `jnp.bfloat16`")
+
+    if k != k_weight:
+        raise ValueError(f"Reduction dimension must match. Got {k} for activations and {k_weight} for weights")
+
+    if weight_scale.shape != (n,):
+        raise ValueError(f"Weight scales must have shape ({n},). Got {weight_scale.shape}")
+
+    if tile_m <= 0 or tile_n <= 0 or tile_k <= 0 or num_pipeline_stages <= 0 or panel_width <= 0:
+        raise ValueError("Tile dimensions, pipeline stages, and panel width must be positive!")
+
+    if n % tile_n or k % tile_k:
+        raise ValueError("tile_n and tile_k must evenly divide the N and K dimensions")
+
+    # weight @ activations.T produces [tile_n, tile_m], so tile_n is WGMMA's M dimension.
+    if tile_n % 64 or tile_m % 8:
+        raise ValueError("tile_n and tile_m must be multiples of 64 and 8 respectively for Hopper WGMMA")
+
+    if tile_k % 128:
+        raise ValueError("tile_k must be a multiple of 128 for the INT8 weight layout")
 
     # GPU Transforms or the layouts (WGMMA Hopper swizzles)
     activation_transforms = (
