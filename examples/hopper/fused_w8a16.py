@@ -6,7 +6,7 @@ from jax.extend import backend
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from utils import get_max_smem_bytes
+from pallasforge.utils import get_max_smem_bytes
 
 
 
