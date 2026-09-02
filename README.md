@@ -1,4 +1,4 @@
-# Pallas Forge
+# PallasForge
 
 Pallas is an extension to JAX for writing custom kernels for GPUs and TPUs. Though many features are still `experimental`, it has matured a lot over the past few years. Though Pallas became better in terms of functionality and documentation, there are still many blockers for people trying to use Pallas, especially on GPUs. For example, the [JAX documentation](https://docs.jax.dev/en/latest/pallas/gpu/index.html) despite being extremely detailed, only contains a few specific generic examples.
 
@@ -8,19 +8,46 @@ There are three major gaps that we want to address:
 2. **GPU performance benchmarks**: Writing kernel alone is not enough. People can look up the API, and use a coding agent like codex or claude to come up with a kernel for a specific use case, but it does not provide a full picture on performance. Unless you know the baseline, it is hard to know whether your kernel is efficient or not. For example, even for a simple matmul kernel, you need to know whether you are making full use of the hardware. This exercise has to be repeated for different GPUs (e.g. Hopper, Blackwell, etc.)
 3. **Profiling**: Hardly any tutorial out there that teaches you the right way to profile your kernels written in Pallas on GPUs. We want this repo to become the goto example for profiling section. Profiling should be intuitive for the end user, and the current resources hardly cut it. 
 
-## Examples
+## Project Structure
 
-Examples are provided as a reference for starters along with educational material to help understand the concepts.
+```
+pallasforge/
+├── docs
+│   ├── GUIDELINES.md                   # Contributor guide / style guide
+│   └── PROPOSALS.md                    # Future kernel RFCs / roadmap
+├── examples
+├── LICENSE
+├── pallasforge                         # Main package containing all tutorials & shared tooling
+│   ├── __init__.py
+│   ├── common                          # Common utilities related to pallas, device, and profiling
+│   │   ├── __init__.py
+│   │   └── utils.py
+│   └── hopper                          # Architecture track (Hopper: H100/H200)
+│       ├── __init__.py
+│       ├── matmul
+│       └── media
+├── pyproject.toml
 
-1. **Hopper Family (H100, H200)**
-    - **Matrix Multiplication**
-        - [Code](./examples/hopper/matmul/bf16_matmul.py)
-    - **Quantize Matrix Multiplication: W8A16 with Fused Dequantization**
-        - [Code](./examples/hopper/matmul/fused_w8a16.py)
+```
 
+## Tutorials
 
-## Community-driven project
+Tutorials are provided as a reference for starters along with educational material to help understand the concepts.
 
-Given how people have changed the meaning of OSS, we want to take a different approach here. Instead of starting a project and then calling for community contributions, we want to develop it *with the community* from day one. Community here does not mean only individuals, but it also includes big teams who love writing kernels, and want to contribute to OSS, JAX/Pallas, and GPUs. We are eager and very much looking forward to contributions from the JAX-Pallas team, and Nvidia's JAX teams.
+1. **Hopper (H100, H200)**
+    - Matrix Multiplication
+        - [Overview and Fundamentals](./pallasforge/hopper/matmul/hopper-wgmma-pipeline.md)
+        - [Basic Matrix Multiplication (BF16 @ BF16)](./pallasforge/hopper/matmul/bf16_matmul.py)
+        - [Quantized Matrix Multiplication (W8 @ A16 with Fused Dequantization)](./pallasforge/hopper/matmul/fused_w8a16.py)
 
-Please refer to the ideas listed [here](./PROPOSALS.md) for contributions. Also, please read the [code guidelines](./GUIDELINES.md) before opening a PR. 
+2. **Blackwell (B100, B200)**
+
+<br><br>
+
+---
+
+<br>
+
+We are taking a slightly different approach to open source with this repository. Instead of building the project behind closed doors and asking for contributions later, we want to develop it *with the community* from day one. This is an open invitation to anyone who loves writing GPU kernels; whether you are a solo developer learning the ropes, or part of the core JAX-Pallas and NVIDIA JAX teams.
+
+If you want to get involved, you can find a list of planned kernels and ideas listed in the [PROPOSALS](./docs/PROPOSALS.md) document. Please take a look at the [code guidelines](./docs/GUIDELINES.md) before opening a PR. 
