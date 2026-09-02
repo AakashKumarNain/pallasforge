@@ -8,6 +8,16 @@ There are three major gaps that we want to address:
 2. **GPU performance benchmarks**: Writing kernel alone is not enough. People can look up the API, and use a coding agent like codex or claude to come up with a kernel for a specific use case, but it does not provide a full picture on performance. Unless you know the baseline, it is hard to know whether your kernel is efficient or not. For example, even for a simple matmul kernel, you need to know whether you are making full use of the hardware. This exercise has to be repeated for different GPUs (e.g. Hopper, Blackwell, etc.)
 3. **Profiling**: Hardly any tutorial out there that teaches you the right way to profile your kernels written in Pallas on GPUs. We want this repo to become the goto example for profiling section. Profiling should be intuitive for the end user, and the current resources hardly cut it. 
 
+## Examples
+
+Examples are provided as a reference for starters along with educational material to help understand the concepts.
+
+1. **Hopper Family (H100, H200)**
+    - **Matrix Multiplication**
+        - [Code](./examples/hopper/matmul/bf16_matmul.py)
+    - **Quantize Matrix Multiplication: W8A16 with Fused Dequantization**
+        - [Code](./examples/hopper/matmul/fused_w8a16.py)
+
 
 ## Community-driven project
 
