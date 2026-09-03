@@ -1,4 +1,10 @@
+import argparse
 from functools import partial
+from itertools import product
+from pathlib import Path
+
+import tune_jax
+from tune_jax import tune_logger
 
 import jax
 import jax.numpy as jnp
@@ -192,7 +198,9 @@ def matmul(
                     # Compute [tile_n, tile_k] @ [tile_k, tile_m]
                     #               weight          activation
                     plgpu.wgmma(acc, weight_fragment, activation_smem.T)
-                    plgpu.wgmma_wait(1)
+
+                    # TODO: Explain why tha value of zero instead of anything else
+                    plgpu.wgmma_wait(0)
 
                 tile_spec = partial(plgpu.BlockSpec, delay_release=1)
                 activation_tile_spec = tile_spec(
@@ -293,172 +301,441 @@ def format_relative_perf(t_kernel: float, t_ref: float) -> str:
         return f"{factor:.2f}x slower"
 
 
-def run_benchmark_and_profiling():
-    key = jax.random.PRNGKey(0)
+# A deliberately bounded starter search space. Expand it after the first pass if
+# the winner lands on one of the boundaries.
+DEFAULT_TUNE_SPACE = {
+    "tile_m": (8, 16, 32, 64),
+    "tile_n": (64, 128, 256),
+    "tile_k": (128, 256),
+    "num_pipeline_stages": (2, 4, 6),
+    "panel_width": (1, 2, 4, 8),
+    "is_persistent": (False, True),
+}
 
-    scenarios = [
-        # --- LLaMA-3 8B (Hidden: 4096, Intermediate: 14336) ---
-        {"desc": "Llama-8B Gate/Up (M=1)", "m": 1, "k": 4096, "n": 14336},
-        {"desc": "Llama-8B Down (M=1)", "m": 1, "k": 14336, "n": 4096},
-        {"desc": "Llama-8B Gate/Up (M=4)", "m": 4, "k": 4096, "n": 14336},
-        {"desc": "Llama-8B Down (M=8)", "m": 8, "k": 14336, "n": 4096},
-        {"desc": "Llama-8B Gate/Up (M=16)", "m": 16, "k": 4096, "n": 14336},
 
-        # --- LLaMA-3 70B (Hidden: 8192, Intermediate: 28672) ---
-        {"desc": "Llama-70B QKV (M=1)", "m": 1, "k": 8192, "n": 8192},
-        {"desc": "Llama-70B Gate/Up (M=1)", "m": 1, "k": 8192, "n": 28672},
-        {"desc": "Llama-70B Down (M=1)", "m": 1, "k": 28672, "n": 8192},
-        {"desc": "Llama-70B Down (M=8)", "m": 8, "k": 28672, "n": 8192},
-        {"desc": "Llama-70B Gate/Up (M=16)", "m": 16, "k": 8192, "n": 28672},
-    ]
+# Shared workload list so tune/benchmark/profile exercise the same shapes.
+SCENARIOS = (
+    # --- LLaMA-3 8B (Hidden: 4096, Intermediate: 14336) ---
+    {"desc": "Llama-8B Gate/Up (M=1)", "m": 1, "k": 4096, "n": 14336},
+    {"desc": "Llama-8B Down (M=1)", "m": 1, "k": 14336, "n": 4096},
+    {"desc": "Llama-8B Gate/Up (M=4)", "m": 4, "k": 4096, "n": 14336},
+    {"desc": "Llama-8B Down (M=8)", "m": 8, "k": 14336, "n": 4096},
+    {"desc": "Llama-8B Gate/Up (M=16)", "m": 16, "k": 4096, "n": 14336},
+    # --- LLaMA-3 70B (Hidden: 8192, Intermediate: 28672) ---
+    {"desc": "Llama-70B QKV (M=1)", "m": 1, "k": 8192, "n": 8192},
+    {"desc": "Llama-70B Gate/Up (M=1)", "m": 1, "k": 8192, "n": 28672},
+    {"desc": "Llama-70B Down (M=1)", "m": 1, "k": 28672, "n": 8192},
+    {"desc": "Llama-70B Down (M=8)", "m": 8, "k": 28672, "n": 8192},
+    {"desc": "Llama-70B Gate/Up (M=16)", "m": 16, "k": 8192, "n": 28672},
+)
 
-    print("=" * 120)
-    print(
-        f"{'Workload':<28} | {'Shape (M, K, N)':<20} | {'Correct':<8} | "
-        f"{'Pallas (ms)':<12} | {'Ref (ms)':<10} | {'Relative Perf':<15} | {'Bandwidth'}"
-    )
-    print("=" * 120)
 
-    for sc in scenarios:
-        m, k, n = sc["m"], sc["k"], sc["n"]
-        key, act_key, weight_key = jax.random.split(key, 3)
+def scenario_shape(scenario):
+    """Return a scenario's canonical (M, K, N) tuple."""
+    return scenario["m"], scenario["k"], scenario["n"]
 
-        # Inputs
-        activations = (jax.random.normal(act_key, (m, k)) * 0.1).astype(jnp.bfloat16)
-        raw_weight = jax.random.normal(weight_key, (n, k), dtype=jnp.float32) * 0.05
-        weights, scale = quantize_weight_per_output_channel(raw_weight)
 
-        # Correctness
-        ref_out = simple_w8a16_matmul(weights, scale, activations)
-        kernel_out = matmul(weights, scale, activations)
+def make_inputs(key, m, k, n):
+    """Create one deterministic W8A16 input set and return the updated PRNG key."""
+    key, act_key, weight_key = jax.random.split(key, 3)
+    activations = (jax.random.normal(act_key, (m, k)) * 0.1).astype(jnp.bfloat16)
+    raw_weight = jax.random.normal(weight_key, (n, k), dtype=jnp.float32) * 0.05
+    weights, scale = quantize_weight_per_output_channel(raw_weight)
+    return key, weights, scale, activations
 
-        ref_out.block_until_ready()
-        kernel_out.block_until_ready()
 
-        # 2. Correctness validation
-        ref_out = simple_w8a16_matmul(weights, scale, activations)
-        kernel_out = matmul(weights, scale, activations)
+def check_correctness(weights, scale, activations, kernel_fn=matmul):
+    """Compare a kernel invocation against the simple BF16 reference."""
+    ref_out = simple_w8a16_matmul(weights, scale, activations)
+    kernel_out = kernel_fn(weights, scale, activations)
+    ref_out.block_until_ready()
+    kernel_out.block_until_ready()
+    return bool(jnp.allclose(ref_out, kernel_out, rtol=1e-2, atol=5e-2))
 
-        # Force completion before measuring errors
-        ref_out.block_until_ready()
-        kernel_out.block_until_ready()
 
-        # # Compare in FP32 so the error calculation itself is not rounded to BF16
-        # ref_f32 = ref_out.astype(jnp.float32)
-        # kernel_f32 = kernel_out.astype(jnp.float32)
-        # diff = kernel_f32 - ref_f32
+def enumerate_valid_tuning_configs(m, k, n, search_space=DEFAULT_TUNE_SPACE):
+    """Build correlated, shape-valid configs before handing them to tune-jax.
 
-        # # Useful error metrics
-        # max_abs_err = float(jnp.max(jnp.abs(diff)))
-        # rel_l2_err = float(
-        #     jnp.linalg.norm(diff.reshape(-1))
-        #     / jnp.maximum(jnp.linalg.norm(ref_f32.reshape(-1)), 1e-12)
-        # )
+    tune-jax normally evaluates a Cartesian product. This kernel has correlated
+    constraints (divisibility, WGMMA layout, accumulator registers, and SMEM),
+    so we pre-filter configs and tune a single ``config_id`` instead.
+    """
+    max_smem_bytes = get_max_smem_bytes()
+    if max_smem_bytes is None:
+        raise ValueError("Unable to find out max shared memory size for this GPU!")
 
-        # # Count elements that violate the exact allclose condition
-        # tolerance = atol + rtol * jnp.abs(ref_f32)
-        # mismatch_mask = jnp.abs(diff) > tolerance
-        # mismatch_count = int(jnp.sum(mismatch_mask))
-        # mismatch_pct = 100.0 * mismatch_count / ref_out.size
+    configs = []
+    for (
+        tile_m,
+        tile_n,
+        tile_k,
+        num_pipeline_stages,
+        panel_width,
+        is_persistent,
+    ) in product(
+        search_space["tile_m"],
+        search_space["tile_n"],
+        search_space["tile_k"],
+        search_space["num_pipeline_stages"],
+        search_space["panel_width"],
+        search_space["is_persistent"],
+    ):
+        # Kernel/WGMMA validity constraints.
+        if tile_m <= 0 or tile_n <= 0 or tile_k <= 0:
+            continue
+        if tile_m % 8 or tile_n % 64 or tile_k % 128:
+            continue
+        if n % tile_n or k % tile_k:
+            continue
 
-        # # Run the same kernel repeatedly on exactly the same inputs.
-        # # Any difference here strongly suggests a race/synchronization problem.
-        # repeat_out_1 = matmul(weights, scale, activations)
-        # repeat_out_2 = matmul(weights, scale, activations)
-        # repeat_out_1.block_until_ready()
-        # repeat_out_2.block_until_ready()
+        # The kernel uses BlockSpec(delay_release=1), therefore the pipeline
+        # must have at least two concurrent stages.
+        if num_pipeline_stages <= 1:
+            continue
 
-        # deterministic = bool(
-        #     jnp.array_equal(kernel_out, repeat_out_1)
-        #     & jnp.array_equal(kernel_out, repeat_out_2)
-        # )
+        # Widths larger than the number of N tiles are equivalent/redundant.
+        num_tiles_n = n // tile_n
+        if panel_width <= 0 or panel_width > num_tiles_n:
+            continue
 
-        rtol = 1e-2
-        atol = 5e-2
+        # Same register and SMEM constraints enforced by matmul().
+        acc_reg_per_thread = tile_m * tile_n // 128
+        if acc_reg_per_thread > 192:
+            continue
 
-        # Standard allclose result
-        # is_correct = bool(jnp.allclose(ref_f32, kernel_f32, rtol=rtol, atol=atol))
-        is_correct = bool(jnp.allclose(ref_out, kernel_out, rtol=rtol, atol=atol))
-        
+        activation_stage_bytes = tile_m * tile_k * 2  # BF16 activations
+        weight_stage_bytes = tile_n * tile_k  # INT8 weights
+        input_smem_bytes = num_pipeline_stages * (
+            activation_stage_bytes + weight_stage_bytes
+        )
+        out_smem_bytes = tile_m * tile_n * 2  # BF16 output staging
+        if input_smem_bytes + out_smem_bytes > max_smem_bytes:
+            continue
 
-        # print(
-        #     f"\n{sc['desc']} ({m}, {k}, {n})\n"
-        #     f"  allclose       : {is_correct}\n"
-        #     f"  max abs error  : {max_abs_err:.6f}\n"
-        #     f"  relative L2    : {rel_l2_err:.6e}\n"
-        #     f"  mismatches     : {mismatch_count}/{ref_out.size} ({mismatch_pct:.4f}%)\n"
-        #     f"  deterministic  : {deterministic}"
-        # )
-
-        # CUPTI measurements
-        pallas_report = benchmark(
-            matmul,
-            args=(weights, scale, activations),
-            warmup=5,
-            iterations=15,
+        configs.append(
+            {
+                "tile_m": tile_m,
+                "tile_n": tile_n,
+                "tile_k": tile_k,
+                "num_pipeline_stages": num_pipeline_stages,
+                "panel_width": panel_width,
+                "is_persistent": is_persistent,
+            }
         )
 
+    if not configs:
+        raise ValueError(f"No valid tuning configs for shape (M={m}, K={k}, N={n})")
+    return configs
+
+
+def tune_matmul_for_shape(
+    weights,
+    scale,
+    activations,
+    *,
+    search_space=DEFAULT_TUNE_SPACE,
+    max_workers=16,
+):
+    """Tune matmul for one concrete input shape.
+
+    Returns:
+      tuned_fn: tune-jax wrapped function containing timing results/cache.
+      best_config: concrete kernel parameters for the winning config.
+      output: output produced by the winning config.
+    """
+
+    m, k = activations.shape
+    n, k_weight = weights.shape
+    if k != k_weight:
+        raise ValueError(f"K mismatch: activations has {k}, weights has {k_weight}")
+
+    configs = enumerate_valid_tuning_configs(m, k, n, search_space)
+
+    def candidate(weights, scale, activations, *, config_id):
+        return matmul(weights, scale, activations, **configs[config_id])
+
+    tuned_fn = tune_jax.tune(
+        candidate,
+        hyperparams={"config_id": tuple(range(len(configs)))},
+        max_workers=max_workers,
+        example_args=(weights, scale, activations),
+    )
+    tuned_jit = jax.jit(tuned_fn)
+    output = tuned_jit(weights, scale, activations)
+    output.block_until_ready()
+
+    # tune-jax exposes the selected hyperparameters on the jitted handle in its
+    # public examples. Keep a fallback for versions that attach them earlier.
+    if hasattr(tuned_jit, "optimal_hyperparams"):
+        hyperparams = tuned_jit.optimal_hyperparams
+    else:
+        hyperparams = tuned_fn.optimal_hyperparams
+    best_config_id = int(hyperparams["config_id"])
+    return tuned_jit, configs[best_config_id], output
+
+
+def run_tuning(
+    scenarios=SCENARIOS,
+    *,
+    search_space=DEFAULT_TUNE_SPACE,
+    max_workers=16,
+):
+    """Tune all requested workloads, verify winners, and return shape->config."""
+    tune_logger.setLevel("INFO")
+    key = jax.random.PRNGKey(0)
+    winners = {}
+
+    print(
+        f"Tuning {len(scenarios)} workload(s) with up to {max_workers} compile workers."
+    )
+
+    for index, scenario in enumerate(scenarios, start=1):
+        m, k, n = scenario_shape(scenario)
+        key, weights, scale, activations = make_inputs(key, m, k, n)
+
+        configs = enumerate_valid_tuning_configs(m, k, n, search_space)
+        print(
+            f"\n[{index}/{len(scenarios)}] {scenario['desc']} "
+            f"shape=({m}, {k}, {n}) candidates={len(configs)}"
+        )
+
+        tuned_fn, best_config, out = tune_matmul_for_shape(
+            weights,
+            scale,
+            activations,
+            search_space=search_space,
+            max_workers=max_workers,
+        )
+
+        ref = simple_w8a16_matmul(weights, scale, activations)
+        ref.block_until_ready()
+        passed = bool(jnp.allclose(ref, out, rtol=1e-2, atol=5e-2))
+        if not passed:
+            raise AssertionError(
+                f"Winning tune-jax config failed correctness for shape "
+                f"{(m, k, n)}: {best_config}"
+            )
+
+        winners[(m, k, n)] = best_config
+        print(f"best config : {best_config}")
+        print(f"correct     : {passed}")
+        print("tune-jax results:")
+        print(tune_jax.tabulate(tuned_fn.timing_results))
+
+    print("\nReusable winners:")
+    for shape, config in winners.items():
+        print(f"    {shape}: {config},")
+
+    return winners
+
+
+def run_benchmark(
+    scenarios=SCENARIOS,
+    *,
+    configs_by_shape=None,
+    warmup=5,
+    iterations=15,
+):
+    """Benchmark the Pallas kernel against the simple JAX reference."""
+    configs_by_shape = configs_by_shape or {}
+    key = jax.random.PRNGKey(0)
+
+    print("=" * 132)
+    print(
+        f"{'Workload':<28} | {'Shape (M, K, N)':<20} | {'Config':<8} | {'Correct':<8} | "
+        f"{'Pallas (ms)':<12} | {'Ref (ms)':<10} | {'Relative Perf':<15} | {'Bandwidth'}"
+    )
+    print("=" * 132)
+
+    for scenario in scenarios:
+        m, k, n = scenario_shape(scenario)
+        shape = (m, k, n)
+        key, weights, scale, activations = make_inputs(key, m, k, n)
+
+        config = configs_by_shape.get(shape)
+        kernel_fn = partial(matmul, **config) if config is not None else matmul
+        config_label = "tuned" if config is not None else "default"
+
+        is_correct = check_correctness(weights, scale, activations, kernel_fn)
+
+        pallas_report = benchmark(
+            kernel_fn,
+            args=(weights, scale, activations),
+            warmup=warmup,
+            iterations=iterations,
+        )
         ref_report = benchmark(
             simple_w8a16_matmul,
             args=(weights, scale, activations),
-            warmup=5,
-            iterations=15,
+            warmup=warmup,
+            iterations=iterations,
         )
 
         t_pallas = pallas_report.median_kernel_time_ms
         t_ref = ref_report.median_kernel_time_ms
-
         perf_str = format_relative_perf(t_pallas, t_ref)
         bw_gbps = compute_memory_bandwidth_gbps(m, k, n, t_pallas)
 
         shape_str = f"({m}, {k}, {n})"
         status_str = "Pass" if is_correct else "Fail"
-        bw_str = f"{bw_gbps / 1000.0:.2f} TB/s" if bw_gbps >= 1000 else f"{bw_gbps:.1f} GB/s"
-
-        print(
-            f"{sc['desc']:<28} | {shape_str:<20} | {status_str:<8} | "
-            f"{t_pallas:<12.4f} | {t_ref:<10.4f} | {perf_str:<15} | {bw_str}"
+        bw_str = (
+            f"{bw_gbps / 1000.0:.2f} TB/s" if bw_gbps >= 1000 else f"{bw_gbps:.1f} GB/s"
         )
 
-    print("=" * 120)
+        print(
+            f"{scenario['desc']:<28} | {shape_str:<20} | {config_label:<8} | "
+            f"{status_str:<8} | {t_pallas:<12.4f} | {t_ref:<10.4f} | "
+            f"{perf_str:<15} | {bw_str}"
+        )
+
+    print("=" * 132)
 
 
-def main():
+def _profile_slug(scenario):
+    """Create a filesystem-friendly directory name for a profile workload."""
+    m, k, n = scenario_shape(scenario)
+    return f"m{m}_k{k}_n{n}"
+
+
+def run_profile(
+    scenarios=SCENARIOS,
+    *,
+    configs_by_shape=None,
+    profile_dir="/tmp/w8a16_matmul_profile",
+    warmup=5,
+    repetitions=10,
+):
+    """Capture one JAX profiler trace per workload.
+
+    Compilation and input creation happen before each trace. The trace itself
+    contains only repeated kernel executions, with explicit trace annotations.
+    """
+    configs_by_shape = configs_by_shape or {}
+    root = Path(profile_dir).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
     key = jax.random.PRNGKey(0)
 
-    # LLM decode shapes (M, K, N) across QKV, MLP-Gate/Up, and MLP-Down
-    # M represents decode batch size (1 for single-stream, 4-16 for batched decode)
-    shapes = [
-        (1, 4096, 4096),  # LLaMA-8B Single-token Attention
-        (1, 4096, 14336),  # LLaMA-8B Single-token MLP Gate/Up
-        (1, 14336, 4096),  # LLaMA-8B Single-token MLP Down
-        (4, 4096, 4096),  # LLaMA-8B Small Batched Decode
-        (16, 4096, 14336),  # LLaMA-8B Batched MLP
-        (1, 8192, 8192),  # LLaMA-70B Single-token Attention
-        (1, 8192, 28672),  # LLaMA-70B Single-token MLP Gate/Up
-    ]
+    print(f"Writing JAX profiler traces under: {root}")
 
-    for m, k, n in shapes:
-        k_act, k_w, key = jax.random.split(key, 3)
+    for index, scenario in enumerate(scenarios, start=1):
+        m, k, n = scenario_shape(scenario)
+        shape = (m, k, n)
+        key, weights, scale, activations = make_inputs(key, m, k, n)
 
-        # Activations: (M, K) in BF16
-        activations = (jax.random.normal(k_act, (m, k)) * 0.1).astype(jnp.bfloat16)
+        config = configs_by_shape.get(shape)
+        kernel_fn = partial(matmul, **config) if config is not None else matmul
+        config_label = "tuned" if config is not None else "default"
 
-        # Weights: (N, K) quantized symmetrically to INT8 with BF16 scales
-        raw_weight = jax.random.normal(k_w, (n, k), dtype=jnp.float32) * 0.05
-        weights, scale = quantize_weight_per_output_channel(raw_weight)
+        # Compile/warm up before starting the trace so compilation and random
+        # input generation do not dominate the captured computation profile.
+        for _ in range(warmup):
+            kernel_fn(weights, scale, activations).block_until_ready()
 
-        # Reference vs Kernel
-        ref = simple_w8a16_matmul(weights, scale, activations)
-        out = matmul(weights, scale, activations)
+        workload_dir = root / _profile_slug(scenario)
+        workload_dir.mkdir(parents=True, exist_ok=True)
 
-        # BF16 tolerance: rtol=1e-2 matches 7-bit mantissa precision; atol=5e-2 covers zero-floor
-        passed = jnp.allclose(ref, out, rtol=1e-2, atol=5e-2)
-        print(f"Shape (M={m:<2}, K={k:<5}, N={n:<5}) : {'Pass' if passed else 'Fail'}")
+        print(
+            f"[{index}/{len(scenarios)}] Profiling {scenario['desc']} "
+            f"shape={shape} config={config_label} -> {workload_dir}"
+        )
 
-        assert passed, f"Kernel mismatch on shape (M={m}, K={k}, N={n})"
+        with jax.profiler.trace(str(workload_dir)):
+            for step in range(repetitions):
+                with jax.profiler.StepTraceAnnotation("w8a16_matmul", step_num=step):
+                    kernel_fn(weights, scale, activations).block_until_ready()
+
+    print(f"Profile capture complete: {root}")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Tune, benchmark, and profile the Hopper Fused W8A16 Pallas kernel."
+    )
+    parser.add_argument(
+        "--tune",
+        action="store_true",
+        help="Tune kernel hyperparameters with tune-jax.",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Benchmark the Pallas kernel against the JAX reference.",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Capture JAX profiler traces for the kernel workloads.",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=16,
+        help="Maximum tune-jax parallel compilation workers (default: 16).",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=5,
+        help="Warmup iterations used by benchmark/profile (default: 5).",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=15,
+        help="Measured benchmark iterations (default: 15).",
+    )
+    parser.add_argument(
+        "--profile-repetitions",
+        type=int,
+        default=10,
+        help="Kernel executions recorded in each profiler trace (default: 10).",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        default="/tmp/w8a16_matmul_profile",
+        help="Root directory for JAX profiler traces.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.max_workers <= 0:
+        parser.error("--max-workers must be positive")
+    if args.warmup < 0:
+        parser.error("--warmup must be non-negative")
+    if args.iterations <= 0:
+        parser.error("--iterations must be positive")
+    if args.profile_repetitions <= 0:
+        parser.error("--profile-repetitions must be positive")
+
+    return parser, args
+
+
+def main(argv=None):
+    parser, args = parse_args(argv)
+
+    if not (args.tune or args.benchmark or args.profile):
+        raise ValueError("No action selected for kernel!")
+
+    winners = None
+    if args.tune:
+        winners = run_tuning(max_workers=args.max_workers)
+
+    # When actions are combined, reuse winners from this process. This makes
+    # `--tune --benchmark` and `--tune --profile` exercise the tuned configs.
+    if args.benchmark:
+        run_benchmark(
+            configs_by_shape=winners,
+            warmup=args.warmup,
+            iterations=args.iterations,
+        )
+
+    if args.profile:
+        run_profile(
+            configs_by_shape=winners,
+            profile_dir=args.profile_dir,
+            warmup=args.warmup,
+            repetitions=args.profile_repetitions,
+        )
 
 
 if __name__ == "__main__":
-    # main()
-    run_benchmark_and_profiling()
+    main()
