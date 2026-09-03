@@ -9,6 +9,7 @@ dependencies = [
     "jaxlib==0.11.1",
     "ruff",
     "xprof",
+    "tune-jax==0.7.5",
 ]
 
 [tool.ruff]
