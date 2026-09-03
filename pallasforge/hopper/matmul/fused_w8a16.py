@@ -294,7 +294,6 @@ def format_relative_perf(t_kernel: float, t_ref: float) -> str:
 
 
 def run_benchmark_and_profiling():
-    jax.config.update("jax_default_matmul_precision", "highest")
     key = jax.random.PRNGKey(0)
 
     scenarios = [
@@ -304,6 +303,7 @@ def run_benchmark_and_profiling():
         {"desc": "Llama-8B Gate/Up (M=4)", "m": 4, "k": 4096, "n": 14336},
         {"desc": "Llama-8B Down (M=8)", "m": 8, "k": 14336, "n": 4096},
         {"desc": "Llama-8B Gate/Up (M=16)", "m": 16, "k": 4096, "n": 14336},
+
         # --- LLaMA-3 70B (Hidden: 8192, Intermediate: 28672) ---
         {"desc": "Llama-70B QKV (M=1)", "m": 1, "k": 8192, "n": 8192},
         {"desc": "Llama-70B Gate/Up (M=1)", "m": 1, "k": 8192, "n": 28672},
@@ -314,36 +314,93 @@ def run_benchmark_and_profiling():
 
     print("=" * 120)
     print(
-        f"{'Workload':<24} | {'Shape (M, K, N)':<18} | {'Correct':<8} | "
+        f"{'Workload':<28} | {'Shape (M, K, N)':<20} | {'Correct':<8} | "
         f"{'Pallas (ms)':<12} | {'Ref (ms)':<10} | {'Relative Perf':<15} | {'Bandwidth'}"
     )
     print("=" * 120)
 
     for sc in scenarios:
         m, k, n = sc["m"], sc["k"], sc["n"]
-        k_act, k_w, key = jax.random.split(key, 3)
+        key, act_key, weight_key = jax.random.split(key, 3)
 
-        # 1. Inputs generation
-        act = (jax.random.normal(k_act, (m, k)) * 0.1).astype(jnp.bfloat16)
-        raw_w = jax.random.normal(k_w, (n, k), dtype=jnp.float32) * 0.05
-        weights, scale = quantize_weight_per_output_channel(raw_w)
+        # Inputs
+        activations = (jax.random.normal(act_key, (m, k)) * 0.1).astype(jnp.bfloat16)
+        raw_weight = jax.random.normal(weight_key, (n, k), dtype=jnp.float32) * 0.05
+        weights, scale = quantize_weight_per_output_channel(raw_weight)
+
+        # Correctness
+        ref_out = simple_w8a16_matmul(weights, scale, activations)
+        kernel_out = matmul(weights, scale, activations)
+
+        ref_out.block_until_ready()
+        kernel_out.block_until_ready()
 
         # 2. Correctness validation
-        ref_out = simple_w8a16_matmul(weights, scale, act)
-        kernel_out = matmul(act, weights, scale)
-        is_correct = jnp.allclose(ref_out, kernel_out, rtol=1e-2, atol=5e-2)
+        ref_out = simple_w8a16_matmul(weights, scale, activations)
+        kernel_out = matmul(weights, scale, activations)
 
-        # 3. CUPTI Measurements
+        # Force completion before measuring errors
+        ref_out.block_until_ready()
+        kernel_out.block_until_ready()
+
+        # # Compare in FP32 so the error calculation itself is not rounded to BF16
+        # ref_f32 = ref_out.astype(jnp.float32)
+        # kernel_f32 = kernel_out.astype(jnp.float32)
+        # diff = kernel_f32 - ref_f32
+
+        # # Useful error metrics
+        # max_abs_err = float(jnp.max(jnp.abs(diff)))
+        # rel_l2_err = float(
+        #     jnp.linalg.norm(diff.reshape(-1))
+        #     / jnp.maximum(jnp.linalg.norm(ref_f32.reshape(-1)), 1e-12)
+        # )
+
+        # # Count elements that violate the exact allclose condition
+        # tolerance = atol + rtol * jnp.abs(ref_f32)
+        # mismatch_mask = jnp.abs(diff) > tolerance
+        # mismatch_count = int(jnp.sum(mismatch_mask))
+        # mismatch_pct = 100.0 * mismatch_count / ref_out.size
+
+        # # Run the same kernel repeatedly on exactly the same inputs.
+        # # Any difference here strongly suggests a race/synchronization problem.
+        # repeat_out_1 = matmul(weights, scale, activations)
+        # repeat_out_2 = matmul(weights, scale, activations)
+        # repeat_out_1.block_until_ready()
+        # repeat_out_2.block_until_ready()
+
+        # deterministic = bool(
+        #     jnp.array_equal(kernel_out, repeat_out_1)
+        #     & jnp.array_equal(kernel_out, repeat_out_2)
+        # )
+
+        rtol = 1e-2
+        atol = 5e-2
+
+        # Standard allclose result
+        # is_correct = bool(jnp.allclose(ref_f32, kernel_f32, rtol=rtol, atol=atol))
+        is_correct = bool(jnp.allclose(ref_out, kernel_out, rtol=rtol, atol=atol))
+        
+
+        # print(
+        #     f"\n{sc['desc']} ({m}, {k}, {n})\n"
+        #     f"  allclose       : {is_correct}\n"
+        #     f"  max abs error  : {max_abs_err:.6f}\n"
+        #     f"  relative L2    : {rel_l2_err:.6e}\n"
+        #     f"  mismatches     : {mismatch_count}/{ref_out.size} ({mismatch_pct:.4f}%)\n"
+        #     f"  deterministic  : {deterministic}"
+        # )
+
+        # CUPTI measurements
         pallas_report = benchmark(
             matmul,
-            args=(act, weights, scale),
+            args=(weights, scale, activations),
             warmup=5,
             iterations=15,
         )
 
         ref_report = benchmark(
             simple_w8a16_matmul,
-            args=(weights, scale, act),
+            args=(weights, scale, activations),
             warmup=5,
             iterations=15,
         )
@@ -351,18 +408,15 @@ def run_benchmark_and_profiling():
         t_pallas = pallas_report.median_kernel_time_ms
         t_ref = ref_report.median_kernel_time_ms
 
-        # Explicit fast vs slow calculation
         perf_str = format_relative_perf(t_pallas, t_ref)
         bw_gbps = compute_memory_bandwidth_gbps(m, k, n, t_pallas)
 
         shape_str = f"({m}, {k}, {n})"
         status_str = "Pass" if is_correct else "Fail"
-        bw_str = (
-            f"{bw_gbps / 1000.0:.2f} TB/s" if bw_gbps >= 1000 else f"{bw_gbps:.1f} GB/s"
-        )
+        bw_str = f"{bw_gbps / 1000.0:.2f} TB/s" if bw_gbps >= 1000 else f"{bw_gbps:.1f} GB/s"
 
         print(
-            f"{sc['desc']:<24} | {shape_str:<18} | {status_str:<8} | "
+            f"{sc['desc']:<28} | {shape_str:<20} | {status_str:<8} | "
             f"{t_pallas:<12.4f} | {t_ref:<10.4f} | {perf_str:<15} | {bw_str}"
         )
 
