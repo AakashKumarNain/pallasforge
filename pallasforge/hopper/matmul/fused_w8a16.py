@@ -1,7 +1,8 @@
+import time
 import argparse
+from pathlib import Path
 from functools import partial
 from itertools import product
-from pathlib import Path
 
 import tune_jax
 from tune_jax import tune_logger
@@ -14,6 +15,38 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from pallasforge.common import get_max_smem_bytes
 from pallasforge.common import benchmark
+from pallasforge.common import format_relative_perf
+
+
+# A deliberately bounded starter search space. Expand it after the first pass if
+# the winner lands on one of the boundaries.
+DEFAULT_TUNE_SPACE = {
+    "tile_m": (8, 16, 32, 64),
+    "tile_n": (64, 128, 256),
+    "tile_k": (128, 256),
+    "num_pipeline_stages": (2, 4, 6),
+    "panel_width": (1, 2, 4, 8),
+    "persistent": (False, True),
+}
+
+
+# Shared workload list so tune/benchmark/profile exercise the same shapes.
+SCENARIOS = (
+    # --- LLaMA-3 8B (Hidden: 4096, Intermediate: 14336) ---
+    {"desc": "Llama-8B Gate/Up (M=1)", "m": 1, "k": 4096, "n": 14336},
+    {"desc": "Llama-8B Down (M=1)", "m": 1, "k": 14336, "n": 4096},
+    {"desc": "Llama-8B Gate/Up (M=4)", "m": 4, "k": 4096, "n": 14336},
+    {"desc": "Llama-8B Down (M=8)", "m": 8, "k": 14336, "n": 4096},
+    {"desc": "Llama-8B Gate/Up (M=16)", "m": 16, "k": 4096, "n": 14336},
+
+    # --- LLaMA-3 70B (Hidden: 8192, Intermediate: 28672) ---
+    {"desc": "Llama-70B QKV (M=1)", "m": 1, "k": 8192, "n": 8192},
+    {"desc": "Llama-70B Gate/Up (M=1)", "m": 1, "k": 8192, "n": 28672},
+    {"desc": "Llama-70B Down (M=1)", "m": 1, "k": 28672, "n": 8192},
+    {"desc": "Llama-70B Down (M=8)", "m": 8, "k": 28672, "n": 8192},
+    {"desc": "Llama-70B Gate/Up (M=16)", "m": 16, "k": 8192, "n": 28672},
+)
+
 
 
 def quantize_weight_per_output_channel(weight):
@@ -42,7 +75,7 @@ def matmul(
     tile_k=128,
     num_pipeline_stages=5,
     panel_width=4,
-    is_persistent=False,
+    persistent=False,
 ):
     m, k = activations.shape
     n, k_weight = weights.shape
@@ -242,7 +275,7 @@ def matmul(
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
         # Grid Dispatch: Persistent Worker Loop vs. 1-to-1 Threadblock Launch
-        if is_persistent:
+        if persistent:
 
             def persistent_loop_body(loop_info):
                 (tile_idx,) = loop_info.index
@@ -253,7 +286,7 @@ def matmul(
             tile_idx = jax.lax.axis_index("out_tile")
             compute_one_output_tile(tile_idx)
 
-    if is_persistent:
+    if persistent:
         launch_grid = (backend.get_default_device().core_count,)
         grid_names = ("sm",)
     else:
@@ -286,53 +319,6 @@ def compute_memory_bandwidth_gbps(m, k, n, time_ms):
     total_bytes = (m * k * 2) + (n * k * 1) + (n * 2) + (m * n * 2)
     time_sec = time_ms / 1000.0
     return (total_bytes / 1e9) / time_sec
-
-
-def format_relative_perf(t_kernel: float, t_ref: float) -> str:
-    """Formats relative performance as Nx faster or Nx slower."""
-    if t_kernel <= 0 or t_ref <= 0:
-        return "N/A"
-
-    if t_kernel <= t_ref:
-        factor = t_ref / t_kernel
-        return f"{factor:.2f}x faster"
-    else:
-        factor = t_kernel / t_ref
-        return f"{factor:.2f}x slower"
-
-
-# A deliberately bounded starter search space. Expand it after the first pass if
-# the winner lands on one of the boundaries.
-DEFAULT_TUNE_SPACE = {
-    "tile_m": (8, 16, 32, 64),
-    "tile_n": (64, 128, 256),
-    "tile_k": (128, 256),
-    "num_pipeline_stages": (2, 4, 6),
-    "panel_width": (1, 2, 4, 8),
-    "is_persistent": (False, True),
-}
-
-
-# Shared workload list so tune/benchmark/profile exercise the same shapes.
-SCENARIOS = (
-    # --- LLaMA-3 8B (Hidden: 4096, Intermediate: 14336) ---
-    {"desc": "Llama-8B Gate/Up (M=1)", "m": 1, "k": 4096, "n": 14336},
-    {"desc": "Llama-8B Down (M=1)", "m": 1, "k": 14336, "n": 4096},
-    {"desc": "Llama-8B Gate/Up (M=4)", "m": 4, "k": 4096, "n": 14336},
-    {"desc": "Llama-8B Down (M=8)", "m": 8, "k": 14336, "n": 4096},
-    {"desc": "Llama-8B Gate/Up (M=16)", "m": 16, "k": 4096, "n": 14336},
-    # --- LLaMA-3 70B (Hidden: 8192, Intermediate: 28672) ---
-    {"desc": "Llama-70B QKV (M=1)", "m": 1, "k": 8192, "n": 8192},
-    {"desc": "Llama-70B Gate/Up (M=1)", "m": 1, "k": 8192, "n": 28672},
-    {"desc": "Llama-70B Down (M=1)", "m": 1, "k": 28672, "n": 8192},
-    {"desc": "Llama-70B Down (M=8)", "m": 8, "k": 28672, "n": 8192},
-    {"desc": "Llama-70B Gate/Up (M=16)", "m": 16, "k": 8192, "n": 28672},
-)
-
-
-def scenario_shape(scenario):
-    """Return a scenario's canonical (M, K, N) tuple."""
-    return scenario["m"], scenario["k"], scenario["n"]
 
 
 def make_inputs(key, m, k, n):
@@ -371,14 +357,14 @@ def enumerate_valid_tuning_configs(m, k, n, search_space=DEFAULT_TUNE_SPACE):
         tile_k,
         num_pipeline_stages,
         panel_width,
-        is_persistent,
+        persistent,
     ) in product(
         search_space["tile_m"],
         search_space["tile_n"],
         search_space["tile_k"],
         search_space["num_pipeline_stages"],
         search_space["panel_width"],
-        search_space["is_persistent"],
+        search_space["persistent"],
     ):
         # Kernel/WGMMA validity constraints.
         if tile_m <= 0 or tile_n <= 0 or tile_k <= 0:
@@ -419,7 +405,7 @@ def enumerate_valid_tuning_configs(m, k, n, search_space=DEFAULT_TUNE_SPACE):
                 "tile_k": tile_k,
                 "num_pipeline_stages": num_pipeline_stages,
                 "panel_width": panel_width,
-                "is_persistent": is_persistent,
+                "persistent": persistent,
             }
         )
 
@@ -460,18 +446,13 @@ def tune_matmul_for_shape(
         max_workers=max_workers,
         example_args=(weights, scale, activations),
     )
-    tuned_jit = jax.jit(tuned_fn)
-    output = tuned_jit(weights, scale, activations)
+    tuned_fn_jit = jax.jit(tuned_fn)
+    output = tuned_fn_jit(weights, scale, activations)
     output.block_until_ready()
 
-    # tune-jax exposes the selected hyperparameters on the jitted handle in its
-    # public examples. Keep a fallback for versions that attach them earlier.
-    if hasattr(tuned_jit, "optimal_hyperparams"):
-        hyperparams = tuned_jit.optimal_hyperparams
-    else:
-        hyperparams = tuned_fn.optimal_hyperparams
+    hyperparams = tuned_fn_jit.optimal_hyperparams
     best_config_id = int(hyperparams["config_id"])
-    return tuned_jit, configs[best_config_id], output
+    return tuned_fn_jit, configs[best_config_id], output
 
 
 def run_tuning(
@@ -490,7 +471,7 @@ def run_tuning(
     )
 
     for index, scenario in enumerate(scenarios, start=1):
-        m, k, n = scenario_shape(scenario)
+        m, k, n = scenario["m"], scenario["k"], scenario["n"]
         key, weights, scale, activations = make_inputs(key, m, k, n)
 
         configs = enumerate_valid_tuning_configs(m, k, n, search_space)
@@ -517,10 +498,10 @@ def run_tuning(
             )
 
         winners[(m, k, n)] = best_config
-        print(f"best config : {best_config}")
-        print(f"correct     : {passed}")
-        print("tune-jax results:")
-        print(tune_jax.tabulate(tuned_fn.timing_results))
+        print(f"\nBest config             : {best_config}")
+        print(f"Kernel correctness passed : {passed}")
+        # print("tune-jax results:")
+        # print(tune_jax.tabulate(tuned_fn.timing_results))
 
     print("\nReusable winners:")
     for shape, config in winners.items():
@@ -548,7 +529,7 @@ def run_benchmark(
     print("=" * 132)
 
     for scenario in scenarios:
-        m, k, n = scenario_shape(scenario)
+        m, k, n = scenario["m"], scenario["k"], scenario["n"]
         shape = (m, k, n)
         key, weights, scale, activations = make_inputs(key, m, k, n)
 
@@ -591,16 +572,10 @@ def run_benchmark(
     print("=" * 132)
 
 
-def _profile_slug(scenario):
-    """Create a filesystem-friendly directory name for a profile workload."""
-    m, k, n = scenario_shape(scenario)
-    return f"m{m}_k{k}_n{n}"
-
-
 def run_profile(
     scenarios=SCENARIOS,
-    *,
     configs_by_shape=None,
+    static_argnames=("tile_m", "tile_n", "tile_k", "num_pipeline_stages", "panel_width","persistent"),
     profile_dir="/tmp/w8a16_matmul_profile",
     warmup=5,
     repetitions=10,
@@ -615,23 +590,33 @@ def run_profile(
     root.mkdir(parents=True, exist_ok=True)
     key = jax.random.PRNGKey(0)
 
+
     print(f"Writing JAX profiler traces under: {root}")
 
     for index, scenario in enumerate(scenarios, start=1):
-        m, k, n = scenario_shape(scenario)
+        m, k, n = scenario["m"], scenario["k"], scenario["n"]
         shape = (m, k, n)
         key, weights, scale, activations = make_inputs(key, m, k, n)
 
         config = configs_by_shape.get(shape)
         kernel_fn = partial(matmul, **config) if config is not None else matmul
+
+        print("\nLowering and compiling kernel function...")
+        start = time.perf_counter()
+        jitted_fn = jitted_fn = jax.jit(kernel_fn, static_argnames=static_argnames)
+        lowered = jitted_fn.lower(weights, scale, activations)
+        compiled = lowered.compile()
+        end = time.perf_counter()
+        print(f"Kernel function compiled. Time taken:  {(end - start)*1000:.3f} ms")
+        
         config_label = "tuned" if config is not None else "default"
 
         # Compile/warm up before starting the trace so compilation and random
         # input generation do not dominate the captured computation profile.
         for _ in range(warmup):
-            kernel_fn(weights, scale, activations).block_until_ready()
+            compiled(weights, scale, activations).block_until_ready()
 
-        workload_dir = root / _profile_slug(scenario)
+        workload_dir = root / f"m{m}_k{k}_n{n}"
         workload_dir.mkdir(parents=True, exist_ok=True)
 
         print(
@@ -642,7 +627,7 @@ def run_profile(
         with jax.profiler.trace(str(workload_dir)):
             for step in range(repetitions):
                 with jax.profiler.StepTraceAnnotation("w8a16_matmul", step_num=step):
-                    kernel_fn(weights, scale, activations).block_until_ready()
+                    compiled(weights, scale, activations).block_until_ready()
 
     print(f"Profile capture complete: {root}")
 
