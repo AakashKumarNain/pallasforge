@@ -53,6 +53,19 @@ def get_max_smem_bytes():
     return int(smem_bytes) if smem_bytes else None
 
 
+def format_relative_perf(t_kernel: float, t_ref: float) -> str:
+    """Formats relative performance as Nx faster or Nx slower."""
+    if t_kernel <= 0 or t_ref <= 0:
+        return "N/A"
+
+    if t_kernel <= t_ref:
+        factor = t_ref / t_kernel
+        return f"{factor:.2f}x faster"
+    else:
+        factor = t_kernel / t_ref
+        return f"{factor:.2f}x slower"
+
+
 def benchmark(
     fn: Callable[..., Any],
     *,
