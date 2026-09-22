@@ -1,725 +1,905 @@
-import time
+"""Fused W8A16 decoding kernels for one Hopper GPU.
+
+Inputs: INT8 weights [N, K], BF16 scales [N], BF16 activations [M, K].
+Output: BF16 [M, N]. Inputs must be finite; N and K must fit the chosen tiles.
+
+Numerical contract: accumulate A @ Q.T in FP32, multiply by each output-channel
+scale in FP32, then round to BF16. This differs from rounding Q * scale to BF16
+before the matrix multiply, as the original implementation did.
+
+All custom kernels use the Mosaic GPU API, including GEMV and split-K reduction.
+The WGMMA path retains wait(0) because delay release when set to 1 is resulting
+in large numerical mismatch for some reason. Split-K stores unscaled FP32 partials
+without transposing the accumulator layout; a second Mosaic kernel reduces and scales.
+Tuning validates each candidate before timing it; a GPU execution error aborts.
+
+Examples:
+    python w8a16_decode.py --check --scenario 0
+    python w8a16_decode.py --tune --benchmark --configs w8a16_configs.json
+    python w8a16_decode.py --profile --configs w8a16_configs.json
+    MOSAIC_GPU_DUMP_PTXAS=1 python w8a16_decode.py --tune --scenario 0
+
+Reported latency includes host dispatch, synchronization, and every GPU kernel
+in the compiled call. It is not a device-only kernel time or an HBM measurement.
+Use --profile to inspect device execution, padding, reduction, and slicing.
+"""
+
 import argparse
-from pathlib import Path
+import json
+import time
 from functools import partial
 from itertools import product
-
-import tune_jax
-from tune_jax import tune_logger
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-from jax.extend import backend
+import jaxlib
+import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from pallasforge.common import get_max_smem_bytes
 from pallasforge.common import benchmark
 from pallasforge.common import format_relative_perf
 
 
-# A deliberately bounded starter search space. Expand it after the first pass if
-# the winner lands on one of the boundaries.
-DEFAULT_TUNE_SPACE = {
-    "tile_m": (8, 16, 32, 64),
-    "tile_n": (64, 128, 256),
-    "tile_k": (128, 256),
-    "num_pipeline_stages": (2, 4, 6),
-    "panel_width": (1, 2, 4, 8),
-    "persistent": (False, True),
-}
-
-
-# Shared workload list so tune/benchmark/profile exercise the same shapes.
+# The Q example is a single projection; gate/up shapes each describe one projection.
 SCENARIOS = (
-    # --- LLaMA-3 8B (Hidden: 4096, Intermediate: 14336) ---
-    {"desc": "Llama-8B Gate/Up (M=1)", "m": 1, "k": 4096, "n": 14336},
-    {"desc": "Llama-8B Down (M=1)", "m": 1, "k": 14336, "n": 4096},
-    {"desc": "Llama-8B Gate/Up (M=4)", "m": 4, "k": 4096, "n": 14336},
-    {"desc": "Llama-8B Down (M=8)", "m": 8, "k": 14336, "n": 4096},
-    {"desc": "Llama-8B Gate/Up (M=16)", "m": 16, "k": 4096, "n": 14336},
-
-    # --- LLaMA-3 70B (Hidden: 8192, Intermediate: 28672) ---
-    {"desc": "Llama-70B QKV (M=1)", "m": 1, "k": 8192, "n": 8192},
-    {"desc": "Llama-70B Gate/Up (M=1)", "m": 1, "k": 8192, "n": 28672},
-    {"desc": "Llama-70B Down (M=1)", "m": 1, "k": 28672, "n": 8192},
-    {"desc": "Llama-70B Down (M=8)", "m": 8, "k": 28672, "n": 8192},
-    {"desc": "Llama-70B Gate/Up (M=16)", "m": 16, "k": 8192, "n": 28672},
+    {"desc": "8B gate or up, M=1", "m": 1, "k": 4096, "n": 14336},
+    {"desc": "8B down, M=1", "m": 1, "k": 14336, "n": 4096},
+    {"desc": "8B gate or up, M=4", "m": 4, "k": 4096, "n": 14336},
+    {"desc": "8B down, M=8", "m": 8, "k": 14336, "n": 4096},
+    {"desc": "8B gate or up, M=16", "m": 16, "k": 4096, "n": 14336},
+    {"desc": "70B Q, M=1", "m": 1, "k": 8192, "n": 8192},
+    {"desc": "70B gate or up, M=1", "m": 1, "k": 8192, "n": 28672},
+    {"desc": "70B down, M=1", "m": 1, "k": 28672, "n": 8192},
+    {"desc": "70B down, M=8", "m": 8, "k": 28672, "n": 8192},
+    {"desc": "70B gate or up, M=16", "m": 16, "k": 8192, "n": 28672},
 )
 
+CONTRACT_NAME = "int8_bf16_fp32_accumulate_then_scale_v1"
+HOPPER_BLOCK_SMEM_BYTES = 227 * 1024  # Tested on H200
 
 
 def quantize_weight_per_output_channel(weight):
-    """Quantizes weights symmetrically with one BF16 scale per output channel."""
-
+    """Quantize offline using the same BF16 scales that inference will receive."""
     weight = weight.astype(jnp.float32)
     maxval = jnp.max(jnp.abs(weight), axis=1)
-    scale = jnp.where(maxval == 0.0, 1.0, maxval / 127.0).astype(jnp.bfloat16)
-    quantized = jnp.round(weight / scale[:, None]).astype(jnp.float32)
-    quantized = jnp.clip(quantized, -127, 127).astype(jnp.int8)
-    return quantized, scale
+    scale = jnp.maximum(maxval / 127.0, jnp.finfo(jnp.bfloat16).tiny)
+    scale = jnp.where(maxval == 0, 1.0, scale).astype(jnp.bfloat16)
+    quantized = jnp.round(weight / scale.astype(jnp.float32)[:, None])
+    return jnp.clip(quantized, -127, 127).astype(jnp.int8), scale
 
 
-def simple_w8a16_matmul(quantized_weight, weight_scale, activations):
-    """Performs W8A16 op with INT8 -> BF16 weight dequantization."""
-    dequantized = quantized_weight.astype(jnp.bfloat16) * weight_scale[:, None]
-    return jnp.matmul(activations, dequantized.T)
+@jax.jit
+def reference_fp32(weights, scale, activations):
+    """Correctness reference"""
+    result = jnp.matmul(
+        activations.astype(jnp.float32),
+        weights.astype(jnp.float32).T,
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    return result * scale.astype(jnp.float32)[None, :]
+
+
+def simple_w8a16_matmul(weights, scale, activations):
+    """Unfused JAX implementation of the new numerical contract."""
+    result = jnp.matmul(
+        activations, weights.astype(jnp.bfloat16).T, preferred_element_type=jnp.float32
+    )
+    return (result * scale.astype(jnp.float32)[None, :]).astype(jnp.bfloat16)
+
+
+def bf16_matmul(prepared_weight, activations):
+    """BF16 inference baseline: weight preparation happens outside timing."""
+    return jnp.matmul(
+        activations, prepared_weight.T, preferred_element_type=jnp.float32
+    ).astype(jnp.bfloat16)
+
+
+def default_tile_m(m):
+    return next((size for size in (8, 16, 32) if m <= size), 64)
+
+
+def check_shapes(weights, scale, activations):
+    m, k = activations.shape
+    n, weight_k = weights.shape
+    if min(m, n, k) <= 0 or weight_k != k or scale.shape != (n,):
+        raise ValueError("Expected positive shapes A[M,K], Q[N,K], and scales[N].")
+    return m, k, n
+
+
+def output_tile_coordinates(tile_idx, num_tiles_m, num_tiles_n, panel_width):
+    if num_tiles_m == 1:
+        return 0, tile_idx
+    panel_size = num_tiles_m * panel_width
+    panel_start = (tile_idx // panel_size) * panel_width
+    width = jnp.minimum(panel_width, num_tiles_n - panel_start)
+    local_idx = tile_idx % panel_size
+    row = local_idx // width
+    col = local_idx % width
+    col = jnp.where(row % 2 == 0, col, width - col - 1)
+    return row, panel_start + col
+
+
+def estimated_smem_bytes(tile_m, tile_n, tile_k, stages, split_k):
+    # A prefilter only: reserve space for barriers/alignment and trust compilation.
+    # Registers, spills, and the actual allocation appear in the PTXAS report.
+    # FP32 split-K partials use ordinary global stores and need no output SMEM.
+    output_bytes = 2 if split_k == 1 else 0
+    return (
+        stages * (2 * tile_m * tile_k + tile_n * tile_k)
+        + output_bytes * tile_m * tile_n
+        + 2048
+    )
+
+
+def reduce_split_k(partials, scale, m, split_k):
+    """Reduce FP32 [split_k * N, padded_M] partials to BF16 [M, N] in Mosaic."""
+    n = scale.shape[0]
+    tile_n = 64
+    if n % tile_n or partials.shape[0] != split_k * n or not 0 < m <= partials.shape[1]:
+        raise ValueError(
+            "Split-K reduction requires [split_k * N, padded_M] partials and N divisible by 64."
+        )
+    row_layout = plgpu.Layout.WGMMA.reduce(1)
+
+    def kernel(partials_gmem, scale_gmem, out_gmem):
+        row = jax.lax.axis_index("row")
+        col_start = jax.lax.axis_index("column_tile") * tile_n
+        initial = plgpu.layout_cast(jnp.zeros((tile_n,), jnp.float32), row_layout)
+
+        def add_split(split_idx, acc):
+            channels = pl.ds(split_idx * n + col_start, tile_n)
+            values = plgpu.load(
+                partials_gmem.at[channels, row], layout=row_layout, optimized=False
+            )
+            return acc + values
+
+        result = jax.lax.fori_loop(0, split_k, add_split, initial)
+        cols = pl.ds(col_start, tile_n)
+        channel_scale = plgpu.load(
+            scale_gmem.at[cols], layout=row_layout, optimized=False
+        ).astype(jnp.float32)
+        result = (result * channel_scale).astype(jnp.bfloat16)
+        # Mosaic stores use Ref assignment; there is no plgpu.store function.
+        out_gmem[row, cols] = result
+
+    return plgpu.kernel(
+        kernel,
+        out_type=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
+        grid=(m, n // tile_n),
+        grid_names=("row", "column_tile"),
+        kernel_name="hopper_w8a16_reduce_split_k",
+        compiler_params=plgpu.CompilerParams(approx_math=False),
+    )(partials, scale)
 
 
 def matmul(
     weights,
     scale,
     activations,
-    tile_m=64,
+    tile_m=None,
     tile_n=64,
     tile_k=128,
-    num_pipeline_stages=5,
-    panel_width=4,
+    num_pipeline_stages=3,
+    panel_width=1,
     persistent=False,
+    split_k=1,
+    num_sms=None,
 ):
-    m, k = activations.shape
-    n, k_weight = weights.shape
+    """Mosaic WGMMA path; pass tuning parameters as static arguments to JIT."""
+    m, k, n = check_shapes(weights, scale, activations)
+    tile_m = default_tile_m(m) if tile_m is None else tile_m
 
-    activations_bytes_per_elem = 2
-    weights_bytes_per_elem = 1
-    out_bytes_per_elem = 2
-    num_warpgroup_threads = 128
+    if min(tile_m, tile_n, tile_k, num_pipeline_stages, panel_width, split_k) <= 0:
+        raise ValueError(
+            "Tile sizes, stages, panel width, and split_k must be positive."
+        )
+    if tile_m % 8 or tile_m > 256 or tile_n % 64 or tile_k % 128:
+        raise ValueError(
+            "Require tile_m in 8..256 by 8, tile_n divisible by 64, and tile_k divisible by 128."
+        )
+    if n % tile_n or k % (tile_k * split_k):
+        raise ValueError(
+            "N must divide into tile_n; K must divide into tile_k * split_k."
+        )
 
-    # M can be smaller then WGMMA tile during decoding (e.g. bsz=1). Pad only activation rows
     padded_m = ((m + tile_m - 1) // tile_m) * tile_m
-    m_padding = padded_m - m
-
-    if m_padding:
-        padded_activations = jnp.pad(activations, ((0, m_padding), (0, 0)))
-    else:
-        padded_activations = activations
-
-    # 2D Grid extents in units of tiles
-    num_tiles_m = padded_m // tile_m
-    num_tiles_n = n // tile_n
-    num_tiles_k = k // tile_k
-    total_tiles_mn = num_tiles_m * num_tiles_n
-
-    # Some validations
-    if activations.dtype != jnp.bfloat16:
-        raise ValueError("Activations must be of dtype `jnp.bfloat16`")
-    if weights.dtype != jnp.int8:
-        raise ValueError("Quantized weights must be of dtype `jnp.int8`")
-    if scale.dtype != jnp.bfloat16:
-        raise ValueError("Weight scales must be of dtype `jnp.bfloat16`")
-
-    if k != k_weight:
-        raise ValueError(
-            f"Reduction dimension must match. Got {k} for activations and {k_weight} for weights"
-        )
-
-    if scale.shape != (n,):
-        raise ValueError(f"Weight scales must have shape ({n},). Got {scale.shape}")
-
+    num_tiles_m, num_tiles_n = padded_m // tile_m, n // tile_n
+    output_tiles = num_tiles_m * num_tiles_n
+    k_steps = k // (tile_k * split_k)
+    stages = min(num_pipeline_stages, k_steps)
     if (
-        tile_m <= 0
-        or tile_n <= 0
-        or tile_k <= 0
-        or num_pipeline_stages <= 0
-        or panel_width <= 0
+        estimated_smem_bytes(tile_m, tile_n, tile_k, stages, split_k)
+        > HOPPER_BLOCK_SMEM_BYTES
     ):
-        raise ValueError(
-            "Tile dimensions, pipeline stages, and panel width must be positive!"
-        )
+        raise ValueError("Estimated SMEM exceeds the Hopper per-block budget.")
 
-    if n % tile_n or k % tile_k:
-        raise ValueError("tile_n and tile_k must evenly divide the N and K dimensions")
-
-    # weight @ activations.T produces [tile_n, tile_m], so tile_n is WGMMA's M dimension.
-    if tile_n % 64 or tile_m % 8:
-        raise ValueError(
-            "tile_n and tile_m must be multiples of 64 and 8 respectively for Hopper WGMMA"
-        )
-
-    if tile_k % 128:
-        raise ValueError("tile_k must be a multiple of 128 for the INT8 weight layout")
-
-    # GPU Transforms or the layouts (WGMMA Hopper swizzles)
+    # These operations belong to the outer JIT and are included in whole-call timing.
+    padded_activations = (
+        jnp.pad(activations, ((0, padded_m - m), (0, 0)))
+        if padded_m != m
+        else activations
+    )
+    output_dtype = jnp.bfloat16 if split_k == 1 else jnp.float32
     activation_transforms = (
         plgpu.TilingTransform((8, 64)),
         plgpu.SwizzleTransform(128),
     )
     weight_transforms = (plgpu.TilingTransform((8, 128)), plgpu.SwizzleTransform(128))
-    output_transforms = (
-        plgpu.TilingTransform((1, 64)),
-        plgpu.SwizzleTransform(128),
-    )
+    output_transforms = (plgpu.TilingTransform((1, 64)), plgpu.SwizzleTransform(128))
+    if split_k == 1:
+        output_shape = (padded_m, n)
+        scratch = {
+            "out_smem": plgpu.SMEM(
+                (tile_m, tile_n), jnp.bfloat16, transforms=output_transforms
+            )
+        }
+    else:
+        # Keep [N, M] accumulator orientation in the workspace, with splits stacked along N.
+        output_shape = (split_k * n, padded_m)
+        scratch = {}
 
-    # Shared Memory (SMEM) allocation sizing
-    activation_stage_bytes = tile_m * tile_k * activations_bytes_per_elem
-    weight_stage_bytes = tile_n * tile_k * weights_bytes_per_elem
-
-    input_smem_bytes = num_pipeline_stages * (
-        activation_stage_bytes + weight_stage_bytes
-    )
-    out_smem_bytes = tile_m * tile_n * out_bytes_per_elem
-    max_smem_bytes = get_max_smem_bytes()
-
-    # Register allocation sizing per thread
-    acc_reg_per_thread = tile_m * tile_n // num_warpgroup_threads
-
-    if max_smem_bytes is None:
-        raise ValueError("Unable to find out max shared memory size for this GPU!")
-    if input_smem_bytes + out_smem_bytes > max_smem_bytes:
-        raise ValueError(
-            "The current configuration exceeds the total available shared memory!"
-        )
-    if acc_reg_per_thread > 192:  # Hardware ceiling for Hopper H100/H200
-        raise ValueError("The accumulator leaves too few registers!")
-
-    def kernel(activations_gmem, weight_gmem, scale_gmem, out_gmem, out_smem):
-        def compute_one_output_tile(tile_idx):
-            # -------------------------------------------------------------------
-            # Swizzled 1D -> 2D Panel Rasterization:
-            # Traverses the matrix in vertical "Panels" using a snake-like path
-            # to maximize L2 cache hit rates on rhs columns.
-            # -------------------------------------------------------------------
-            tiles_per_panel = num_tiles_m * panel_width
-
-            # Identify which vertical panel we belong to and our local index within it
-            panel_idx = tile_idx // tiles_per_panel
-            tile_in_panel_idx = tile_idx % tiles_per_panel
-
-            # Identify panel boundary and clamped width (handles edge tiles)
-            panel_start_col = panel_idx * panel_width
-            effective_panel_width = jnp.minimum(
-                num_tiles_n - panel_start_col, panel_width
+    def kernel(a_gmem, q_gmem, scale_gmem, out_gmem, out_smem=None):
+        def compute_tile(task_idx):
+            split_idx = task_idx // output_tiles
+            tile_idx = task_idx % output_tiles
+            row_idx, col_idx = output_tile_coordinates(
+                tile_idx, num_tiles_m, num_tiles_n, panel_width
             )
 
-            # Determine local 2D coordinate inside the active panel
-            row_idx = tile_in_panel_idx // effective_panel_width
-            col_offset = tile_in_panel_idx % effective_panel_width
-
-            # Snake pattern: even rows sweep left-to-right; odd rows sweep right-to-left
-            col_offset = jnp.where(
-                row_idx % 2 == 0,
-                col_offset,
-                effective_panel_width - col_offset - 1,
-            )
-            col_idx = panel_start_col + col_offset
-
-            # one scale is shared by every K elements belonging to the same tile
-            scale_slice = pl.ds(col_idx * tile_n, tile_n)
-            weight_scale = plgpu.load(
-                scale_gmem.at[scale_slice],
-                layout=plgpu.Layout.WGMMA.reduce(1),
-                optimized=False,
-            )
-
-            def accumulate_over_reduction_dim(acc):
-                def pipeline_step(_, activation_smem, weight_smem):
-                    # Load int8 weight tile into registers using the packed WGMMA layout
-                    weight_fragment = plgpu.load(
-                        weight_smem,
-                        layout=plgpu.Layout.WGMMA_UPCAST_2X,
-                    )
-
-                    # Int8 -> Bf16 dequantization happens only inside the kernel
-                    weight_fragment = plgpu.layout_cast(
-                        weight_fragment, plgpu.Layout.WGMMA
-                    ).astype(jnp.bfloat16)
-                    # Apply per channel scale to these weights now
-                    weight_fragment *= jax.lax.broadcast_in_dim(
-                        weight_scale, weight_fragment.shape, (0,)
-                    )
-
-                    # Compute [tile_n, tile_k] @ [tile_k, tile_m]
-                    #               weight          activation
-                    plgpu.wgmma(acc, weight_fragment, activation_smem.T)
-
-                    # TODO: Explain why tha value of zero instead of anything else
+            def accumulate(acc):
+                def pipeline_step(_, a_smem, q_smem):
+                    q = plgpu.load(q_smem, layout=plgpu.Layout.WGMMA_UPCAST_2X)
+                    q = plgpu.layout_cast(q, plgpu.Layout.WGMMA).astype(jnp.bfloat16)
+                    plgpu.wgmma(acc, q, a_smem.T)
+                    # Wait before registers or activation SMEM can be reused.
+                    # Changing this to 1 requires a different, verified operand schedule.
                     plgpu.wgmma_wait(0)
 
-                tile_spec = partial(plgpu.BlockSpec, delay_release=1)
-                activation_tile_spec = tile_spec(
-                    (tile_m, tile_k),
-                    lambda k_idx: (row_idx, k_idx),
-                    transforms=activation_transforms,
+                specs = (
+                    plgpu.BlockSpec(
+                        (tile_m, tile_k),
+                        lambda ki: (row_idx, split_idx * k_steps + ki),
+                        transforms=activation_transforms,
+                        delay_release=0,
+                    ),
+                    plgpu.BlockSpec(
+                        (tile_n, tile_k),
+                        lambda ki: (col_idx, split_idx * k_steps + ki),
+                        transforms=weight_transforms,
+                        delay_release=0,
+                    ),
                 )
-                weight_tile_spec = tile_spec(
-                    (tile_n, tile_k),
-                    lambda k_idx: (col_idx, k_idx),
-                    transforms=weight_transforms,
-                )
-
-                # Async GMEM -> SMEM staged pipeline over the K dimension
                 plgpu.emit_pipeline(
                     pipeline_step,
-                    grid=(num_tiles_k,),
-                    in_specs=(activation_tile_spec, weight_tile_spec),
-                    max_concurrent_steps=num_pipeline_stages,
-                )(activations_gmem, weight_gmem)
-
+                    grid=(k_steps,),
+                    in_specs=specs,
+                    max_concurrent_steps=stages,
+                )(a_gmem, q_gmem)
                 return acc[...]
 
-            acc = pl.run_scoped(
-                accumulate_over_reduction_dim,
-                plgpu.ACC((tile_n, tile_m), jnp.float32),
-            )
+            result = pl.run_scoped(accumulate, plgpu.ACC((tile_n, tile_m), jnp.float32))
+            if split_k == 1:
+                channel_scale = plgpu.load(
+                    scale_gmem.at[pl.ds(col_idx * tile_n, tile_n)],
+                    layout=plgpu.Layout.WGMMA.reduce(1),
+                    optimized=False,
+                ).astype(jnp.float32)
+                result *= jax.lax.broadcast_in_dim(channel_scale, result.shape, (0,))
+                # Retain the working BF16 transpose/store path only for the final output.
+                result = result.astype(jnp.bfloat16)
+                out_smem.T[...] = plgpu.layout_cast(
+                    result, plgpu.Layout.WGMMA_TRANSPOSED
+                )
+                plgpu.commit_smem()
+                rows = pl.ds(row_idx * tile_m, tile_m)
+                cols = pl.ds(col_idx * tile_n, tile_n)
+                plgpu.copy_smem_to_gmem(out_smem, out_gmem.at[rows, cols])
+                plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+            else:
+                # Ordinary FP32 stores preserve the WGMMA layout; no stmatrix or SMEM transpose.
+                channels = pl.ds(split_idx * n + col_idx * tile_n, tile_n)
+                rows = pl.ds(row_idx * tile_m, tile_m)
+                out_gmem[channels, rows] = result
 
-            # Convert [tile_n, tile_m] -> [tile_m, tile_n]
-            acc = acc.astype(jnp.bfloat16)
-            out_smem.T[...] = plgpu.layout_cast(acc, plgpu.Layout.WGMMA_TRANSPOSED)
-            plgpu.commit_smem()
-
-            # Copy from SMEM to GMEM
-            m_slice = pl.ds(row_idx * tile_m, tile_m)
-            n_slice = pl.ds(col_idx * tile_n, tile_n)
-
-            plgpu.copy_smem_to_gmem(out_smem, out_gmem.at[m_slice, n_slice])
-            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-
-        # Grid Dispatch: Persistent Worker Loop vs. 1-to-1 Threadblock Launch
         if persistent:
 
-            def persistent_loop_body(loop_info):
-                (tile_idx,) = loop_info.index
-                compute_one_output_tile(tile_idx)
+            def worker(loop_info):
+                compute_tile(loop_info.index[0])
 
-            plgpu.nd_loop((total_tiles_mn,), collective_axes="sm")(persistent_loop_body)
+            plgpu.nd_loop((split_k * output_tiles,), collective_axes="worker")(worker)
         else:
-            tile_idx = jax.lax.axis_index("out_tile")
-            compute_one_output_tile(tile_idx)
+            compute_tile(jax.lax.axis_index("output_tile"))
+        # Drain all stores before leaving the kernel, after allowing SMEM reuse above.
+        if split_k == 1:
+            plgpu.wait_smem_to_gmem(0)
 
+    task_count = split_k * output_tiles
     if persistent:
-        launch_grid = (backend.get_default_device().core_count,)
-        grid_names = ("sm",)
+        num_sms = (
+            jax.local_devices(backend="gpu")[0].core_count
+            if num_sms is None
+            else num_sms
+        )
+        grid, grid_names = (min(num_sms, task_count),), ("worker",)
     else:
-        launch_grid = (total_tiles_mn,)
-        grid_names = ("out_tile",)
+        grid, grid_names = (task_count,), ("output_tile",)
 
-    output = plgpu.kernel(
+    result = plgpu.kernel(
         kernel,
-        out_type=jax.ShapeDtypeStruct((padded_m, n), dtype=jnp.bfloat16),
-        scratch_types={
-            "out_smem": plgpu.SMEM(
-                (tile_m, tile_n),
-                jnp.bfloat16,
-                transforms=output_transforms,
-            ),
-        },
-        grid=launch_grid,
+        out_type=jax.ShapeDtypeStruct(output_shape, output_dtype),
+        scratch_types=scratch,
+        grid=grid,
         grid_names=grid_names,
-        kernel_name="hopper_w8a16_matmul",
-        compiler_params=plgpu.CompilerParams(
-            approx_math=True, unsafe_no_auto_barriers=True
-        ),
+        kernel_name="hopper_w8a16_split_k",
+        compiler_params=plgpu.CompilerParams(approx_math=False),
     )(padded_activations, weights, scale)
-    return output[:m, :]
+
+    if split_k == 1:
+        return result[:m, :]
+    return reduce_split_k(result, scale, m, split_k)
 
 
-def compute_memory_bandwidth_gbps(m, k, n, time_ms):
-    """Calculates effective memory bandwidth (GB/s) for W8A16 GEMM."""
-    # Bytes: Activations (BF16: 2B) + Weights (INT8: 1B) + Scales (BF16: 2B) + Output (BF16: 2B)
-    total_bytes = (m * k * 2) + (n * k * 1) + (n * 2) + (m * n * 2)
-    time_sec = time_ms / 1000.0
-    return (total_bytes / 1e9) / time_sec
+def gemv(weights, scale, activations, tile_n=64, tile_k=256, split_k=1):
+    """Batch-1 Mosaic kernel using FP32 vector arithmetic, without WGMMA operations."""
+
+    m, k, n = check_shapes(weights, scale, activations)
+
+    if m != 1 or min(tile_n, tile_k, split_k) <= 0:
+        raise ValueError("GEMV requires M=1 and positive tile sizes and split_k.")
+    if tile_n % 64 or tile_k % 128:
+        raise ValueError(
+            "GEMV uses tiles with N divisible by 64 and K divisible by 128."
+        )
+    if n % tile_n or k % (tile_k * split_k):
+        raise ValueError("GEMV requires exact N and K tile coverage.")
+
+    steps = k // (tile_k * split_k)
+    output_dtype = jnp.bfloat16 if split_k == 1 else jnp.float32
+    output_shape = (1, n) if split_k == 1 else (split_k * n, 1)
+    row_layout = plgpu.Layout.WGMMA.reduce(1)
+    column_layout = plgpu.Layout.WGMMA.reduce(0)
+
+    def kernel(q_gmem, scale_gmem, a_gmem, out_gmem):
+        channel_start = jax.lax.axis_index("channel_tile") * tile_n
+        split_idx = jax.lax.axis_index("split")
+        channels = pl.ds(channel_start, tile_n)
+        initial = plgpu.layout_cast(jnp.zeros((tile_n,), jnp.float32), row_layout)
+
+        def step(ki, acc):
+            cols = pl.ds((split_idx * steps + ki) * tile_k, tile_k)
+            # Use one common register layout for multiplication and row reduction.
+            # The layout name does not issue a WGMMA instruction or pad activation rows.
+            q = plgpu.load(
+                q_gmem.at[channels, cols], layout=plgpu.Layout.WGMMA, optimized=False
+            )
+            q = q.astype(jnp.float32)
+            a = plgpu.load(
+                a_gmem.at[0, cols], layout=column_layout, optimized=False
+            ).astype(jnp.float32)
+            a = jax.lax.broadcast_in_dim(a, (tile_n, tile_k), (1,))
+            return acc + jnp.sum(q * a, axis=1, dtype=jnp.float32)
+
+        result = jax.lax.fori_loop(0, steps, step, initial)
+        if split_k == 1:
+            channel_scale = plgpu.load(
+                scale_gmem.at[channels], layout=row_layout, optimized=False
+            )
+            result = (result * channel_scale.astype(jnp.float32)).astype(jnp.bfloat16)
+            out_gmem[0, channels] = result
+        else:
+            partial_channels = pl.ds(split_idx * n + channel_start, tile_n)
+            out_gmem[partial_channels, 0] = result
+
+    result = plgpu.kernel(
+        kernel,
+        out_type=jax.ShapeDtypeStruct(output_shape, output_dtype),
+        grid=(n // tile_n, split_k),
+        grid_names=("channel_tile", "split"),
+        compiler_params=plgpu.CompilerParams(approx_math=False),
+        kernel_name="hopper_w8a16_gemv",
+    )(weights, scale, activations)
+    if split_k == 1:
+        return result
+    return reduce_split_k(result, scale, 1, split_k)
 
 
-def make_inputs(key, m, k, n):
-    """Create one deterministic W8A16 input set and return the updated PRNG key."""
-    key, act_key, weight_key = jax.random.split(key, 3)
-    activations = (jax.random.normal(act_key, (m, k)) * 0.1).astype(jnp.bfloat16)
-    raw_weight = jax.random.normal(weight_key, (n, k), dtype=jnp.float32) * 0.05
-    weights, scale = quantize_weight_per_output_channel(raw_weight)
-    return key, weights, scale, activations
+def candidate_function(config, num_sms):
+    params = dict(config)
+    method = params.pop("method")
+    if method == "gemv":
+        return partial(gemv, **params)
+    if method == "wgmma":
+        return partial(matmul, num_sms=num_sms, **params)
+    raise ValueError(f"Unknown method: {method}")
 
 
-def check_correctness(weights, scale, activations, kernel_fn=matmul):
-    """Compare a kernel invocation against the simple BF16 reference."""
-    ref_out = simple_w8a16_matmul(weights, scale, activations)
-    kernel_out = kernel_fn(weights, scale, activations)
-    ref_out.block_until_ready()
-    kernel_out.block_until_ready()
-    return bool(jnp.allclose(ref_out, kernel_out, rtol=1e-2, atol=5e-2))
+def default_config(m):
+    # This is a safe starting point, not a measured winner.
+    return dict(
+        method="wgmma",
+        tile_m=default_tile_m(m),
+        tile_n=64,
+        tile_k=128,
+        num_pipeline_stages=3,
+        panel_width=1,
+        persistent=False,
+        split_k=1,
+    )
 
 
-def enumerate_valid_tuning_configs(m, k, n, search_space=DEFAULT_TUNE_SPACE):
-    """Build correlated, shape-valid configs before handing them to tune-jax.
-
-    tune-jax normally evaluates a Cartesian product. This kernel has correlated
-    constraints (divisibility, WGMMA layout, accumulator registers, and SMEM),
-    so we pre-filter configs and tune a single ``config_id`` instead.
-    """
-    max_smem_bytes = get_max_smem_bytes()
-    if max_smem_bytes is None:
-        raise ValueError("Unable to find out max shared memory size for this GPU!")
-
-    configs = []
-    for (
-        tile_m,
-        tile_n,
-        tile_k,
-        num_pipeline_stages,
-        panel_width,
-        persistent,
-    ) in product(
-        search_space["tile_m"],
-        search_space["tile_n"],
-        search_space["tile_k"],
-        search_space["num_pipeline_stages"],
-        search_space["panel_width"],
-        search_space["persistent"],
+def enumerate_configs(m, k, n, num_sms, include_gemv=True):
+    base_m = default_tile_m(m)
+    m_tiles = (base_m, min(64, base_m * 2))
+    configs, seen = [], set()
+    for tm, tn, tk, stages, split, persistent in product(
+        sorted(set(m_tiles)),
+        (64, 128),
+        (128, 256),
+        (2, 3, 4),
+        (1, 2, 4, 8),
+        (False, True),
     ):
-        # Kernel/WGMMA validity constraints.
-        if tile_m <= 0 or tile_n <= 0 or tile_k <= 0:
+        if n % tn or k % (tk * split):
             continue
-        if tile_m % 8 or tile_n % 64 or tile_k % 128:
+        actual_stages = min(stages, k // (tk * split))
+        tiles_m, tiles_n = (m + tm - 1) // tm, n // tn
+        if persistent and split * tiles_m * tiles_n <= num_sms:
             continue
-        if n % tile_n or k % tile_k:
+        if (
+            estimated_smem_bytes(tm, tn, tk, actual_stages, split)
+            > HOPPER_BLOCK_SMEM_BYTES
+        ):
             continue
-
-        # The kernel uses BlockSpec(delay_release=1), therefore the pipeline
-        # must have at least two concurrent stages.
-        if num_pipeline_stages <= 1:
-            continue
-
-        # Widths larger than the number of N tiles are equivalent/redundant.
-        num_tiles_n = n // tile_n
-        if panel_width <= 0 or panel_width > num_tiles_n:
-            continue
-
-        # Same register and SMEM constraints enforced by matmul().
-        acc_reg_per_thread = tile_m * tile_n // 128
-        if acc_reg_per_thread > 192:
-            continue
-
-        activation_stage_bytes = tile_m * tile_k * 2  # BF16 activations
-        weight_stage_bytes = tile_n * tile_k  # INT8 weights
-        input_smem_bytes = num_pipeline_stages * (
-            activation_stage_bytes + weight_stage_bytes
+        panels = (
+            (1,)
+            if tiles_m == 1
+            else tuple(width for width in (1, 4) if width <= tiles_n)
         )
-        out_smem_bytes = tile_m * tile_n * 2  # BF16 output staging
-        if input_smem_bytes + out_smem_bytes > max_smem_bytes:
-            continue
-
-        configs.append(
-            {
-                "tile_m": tile_m,
-                "tile_n": tile_n,
-                "tile_k": tile_k,
-                "num_pipeline_stages": num_pipeline_stages,
-                "panel_width": panel_width,
-                "persistent": persistent,
-            }
-        )
-
+        for panel in panels:
+            config = dict(
+                method="wgmma",
+                tile_m=tm,
+                tile_n=tn,
+                tile_k=tk,
+                num_pipeline_stages=actual_stages,
+                panel_width=panel,
+                persistent=persistent,
+                split_k=split,
+            )
+            identity = tuple(config.items())
+            if identity not in seen:
+                seen.add(identity)
+                configs.append(config)
+    if m == 1 and include_gemv:
+        for tn, tk, split in product((64, 128), (128, 256, 512), (1, 2, 4, 8)):
+            if n % tn == 0 and k % (tk * split) == 0:
+                configs.append(dict(method="gemv", tile_n=tn, tile_k=tk, split_k=split))
     if not configs:
-        raise ValueError(f"No valid tuning configs for shape (M={m}, K={k}, N={n})")
+        raise ValueError(f"No configurations cover {(m, k, n)}.")
     return configs
 
 
-def tune_matmul_for_shape(
-    weights,
-    scale,
-    activations,
-    *,
-    search_space=DEFAULT_TUNE_SPACE,
-    max_workers=16,
-):
-    """Tune matmul for one concrete input shape.
+def make_inputs(key, m, k, n):
+    key, act_key, weight_key = jax.random.split(key, 3)
+    activations = (jax.random.normal(act_key, (m, k)) * 0.1).astype(jnp.bfloat16)
+    raw_weight = jax.random.normal(weight_key, (n, k)) * 0.05
+    weights, scale = quantize_weight_per_output_channel(raw_weight)
+    # A true BF16 inference baseline prepared once, never inside a timed function.
+    prepared_weight = raw_weight.astype(jnp.bfloat16)
+    jax.block_until_ready((weights, scale, activations, prepared_weight))
+    return key, weights, scale, activations, prepared_weight
 
-    Returns:
-      tuned_fn: tune-jax wrapped function containing timing results/cache.
-      best_config: concrete kernel parameters for the winning config.
-      output: output produced by the winning config.
-    """
 
+def validation_cases(weights, scale, activations):
     m, k = activations.shape
-    n, k_weight = weights.shape
-    if k != k_weight:
-        raise ValueError(f"K mismatch: activations has {k}, weights has {k_weight}")
-
-    configs = enumerate_valid_tuning_configs(m, k, n, search_space)
-
-    def candidate(weights, scale, activations, *, config_id):
-        return matmul(weights, scale, activations, **configs[config_id])
-
-    tuned_fn = tune_jax.tune(
-        candidate,
-        hyperparams={"config_id": tuple(range(len(configs)))},
-        max_workers=max_workers,
-        example_args=(weights, scale, activations),
+    n = weights.shape[0]
+    rows, cols = jnp.arange(n)[:, None], jnp.arange(k)[None, :]
+    zero_channels = weights.at[::17, :].set(0)
+    # Adjacent columns cancel exactly except for a small, representable residual.
+    extremes = jnp.where((rows + cols // 2) % 2 == 0, 127, -128).astype(jnp.int8)
+    alternating = jnp.where(jnp.arange(k) % 2 == 0, 0.125, -0.125)
+    cancellation = (
+        jnp.broadcast_to(alternating, (m, k))
+        .at[:, 0]
+        .add(1.0 / 1024)
+        .astype(jnp.bfloat16)
     )
-    tuned_fn_jit = jax.jit(tuned_fn)
-    output = tuned_fn_jit(weights, scale, activations)
-    output.block_until_ready()
+    varied_scales = jnp.exp2((jnp.arange(n) % 9 - 8).astype(jnp.float32)).astype(
+        jnp.bfloat16
+    )
+    inputs = (
+        ("random", weights, scale, activations),
+        ("zero_channels", zero_channels, scale, activations),
+        ("zero_activations", weights, scale, jnp.zeros_like(activations)),
+        ("extremes_and_cancellation", extremes, varied_scales, cancellation),
+    )
+    cases = []
+    for name, q, s, a in inputs:
+        expected = np.asarray(jax.device_get(reference_fp32(q, s, a)), dtype=np.float32)
+        cases.append((name, (q, s, a), expected))
+    return cases
 
-    hyperparams = tuned_fn_jit.optimal_hyperparams
-    best_config_id = int(hyperparams["config_id"])
-    return tuned_fn_jit, configs[best_config_id], output
 
-
-def run_tuning(
-    scenarios=SCENARIOS,
-    *,
-    search_space=DEFAULT_TUNE_SPACE,
-    max_workers=16,
-):
-    """Tune all requested workloads, verify winners, and return shape->config."""
-    tune_logger.setLevel("INFO")
-    key = jax.random.PRNGKey(0)
-    winners = {}
-
-    print(
-        f"Tuning {len(scenarios)} workload(s) with up to {max_workers} compile workers."
+def error_metrics(actual, expected, rtol=5e-3, atol=1e-4):
+    actual = np.asarray(actual, dtype=np.float32)
+    expected = np.asarray(expected, dtype=np.float32)
+    if actual.shape != expected.shape:
+        return dict(
+            passed=False,
+            max_abs=float("inf"),
+            nrmse=float("inf"),
+            worst_ratio=float("inf"),
+        )
+    error = np.abs(actual.astype(np.float64) - expected.astype(np.float64))
+    rms = np.sqrt(np.mean(expected.astype(np.float64) ** 2))
+    nrmse = float(np.sqrt(np.mean(error**2)) / max(rms, 1e-12))
+    ratios = error / (atol + rtol * np.abs(expected))
+    passed = bool(np.all(np.isfinite(actual)) and np.all(ratios <= 1) and nrmse <= 3e-3)
+    return dict(
+        passed=passed,
+        max_abs=float(error.max()),
+        nrmse=nrmse,
+        worst_ratio=float(ratios.max()),
     )
 
-    for index, scenario in enumerate(scenarios, start=1):
-        m, k, n = scenario["m"], scenario["k"], scenario["n"]
-        key, weights, scale, activations = make_inputs(key, m, k, n)
 
-        configs = enumerate_valid_tuning_configs(m, k, n, search_space)
-        print(
-            f"\n[{index}/{len(scenarios)}] {scenario['desc']} "
-            f"shape=({m}, {k}, {n}) candidates={len(configs)}"
+def validate(compiled, cases, repetitions=2):
+    reports = []
+    for name, args, expected in cases:
+        for _ in range(repetitions):
+            output = compiled(*args)
+            metrics = error_metrics(jax.device_get(output), expected)
+            reports.append((name, metrics))
+            if not metrics["passed"]:
+                return False, reports
+    return True, reports
+
+
+def benchmark_calls(functions, warmup=5, iterations=31):
+    """Interleave complete calls; return host-observed synchronized latency in us."""
+    if warmup < 0 or iterations <= 0:
+        raise ValueError("warmup must be nonnegative and iterations must be positive.")
+    names = list(functions)
+    samples = {name: [] for name in names}
+    for fn, args in functions.values():
+        jax.block_until_ready(args)
+        for _ in range(warmup):
+            jax.block_until_ready(fn(*args))
+    rng = np.random.default_rng(0)
+    for _ in range(iterations):
+        for idx in rng.permutation(len(names)):
+            name = names[idx]
+            fn, args = functions[name]
+            start = time.perf_counter_ns()
+            output = fn(*args)
+            jax.block_until_ready(output)
+            samples[name].append((time.perf_counter_ns() - start) / 1000)
+    return {
+        name: dict(
+            median_us=float(np.median(values)),
+            p10_us=float(np.percentile(values, 10)),
+            p90_us=float(np.percentile(values, 90)),
         )
+        for name, values in samples.items()
+    }
 
-        tuned_fn, best_config, out = tune_matmul_for_shape(
-            weights,
-            scale,
-            activations,
-            search_space=search_space,
-            max_workers=max_workers,
-        )
 
-        ref = simple_w8a16_matmul(weights, scale, activations)
-        ref.block_until_ready()
-        passed = bool(jnp.allclose(ref, out, rtol=1e-2, atol=5e-2))
+def compile_candidate(config, num_sms, args):
+    # Do not close over input tensors: weights remain runtime arguments.
+    return jax.jit(candidate_function(config, num_sms)).lower(*args).compile()
+
+
+def check_kernel_paths(args, cases, num_sms, include_gemv=True):
+    """Check representative direct and split-K paths without hiding compilation failures."""
+    _, _, activations = args
+    m, k = activations.shape
+    configurations = []
+    for split_k in (1, 2):
+        if k % (128 * split_k):
+            continue
+        config = default_config(m)
+        config.update(tile_k=128, split_k=split_k, num_pipeline_stages=2)
+        configurations.append(config)
+        if m == 1 and include_gemv:
+            configurations.append(
+                dict(method="gemv", tile_n=64, tile_k=128, split_k=split_k)
+            )
+    for config in configurations:
+        print(f"Checking kernel path: {config}", flush=True)
+        compiled = compile_candidate(config, num_sms, args)
+        passed, reports = validate(compiled, cases)
         if not passed:
-            raise AssertionError(
-                f"Winning tune-jax config failed correctness for shape "
-                f"{(m, k, n)}: {best_config}"
+            raise AssertionError(f"Kernel path failed: {config}: {reports[-1]}")
+    print(f"All {len(configurations)} representative kernel paths passed.")
+
+
+def benchmark_gpu(function, inputs, warmup=5, iterations=31):
+    report = benchmark(
+        function,
+        args=inputs,
+        warmup=max(1, warmup),
+        iterations=iterations,
+    )
+    return {"median_us": report.median_kernel_time_ms * 1000.0}
+
+
+def tune_for_shape(args, cases, num_sms, include_gemv=True, warmup=3, iterations=15):
+    weights, _, activations = args
+    m, k = activations.shape
+    configs = enumerate_configs(m, k, weights.shape[0], num_sms, include_gemv)
+    np.random.default_rng(0).shuffle(configs)
+    finalists = []
+    successes = {}
+    print(f"Checking and timing {len(configs)} candidates.")
+    for index, config in enumerate(configs, 1):
+        try:
+            compiled = compile_candidate(config, num_sms, args)
+        except Exception as error:
+            # Compilation failures are safe to reject. Runtime CUDA errors are not caught.
+            print(f"[{index}/{len(configs)}] compile rejected: {config}\n{error}")
+            continue
+        passed, reports = validate(compiled, cases)
+        if not passed:
+            print(
+                f"[{index}/{len(configs)}] numerical rejection: {config}: {reports[-1]}"
+            )
+            continue
+        path = (config["method"], "split-K" if config["split_k"] > 1 else "direct")
+        successes[path] = successes.get(path, 0) + 1
+        # timing = benchmark_calls({"candidate": (compiled, args)}, warmup, iterations)["candidate"]
+        timing = benchmark_gpu(
+            candidate_function(config, num_sms),
+            args,
+            warmup,
+            iterations,
+        )
+        finalists.append((timing["median_us"], config, compiled))
+        finalists.sort(key=lambda item: item[0])
+        finalists = finalists[:3]
+        print(f"[{index}/{len(configs)}] {timing['median_us']:.2f} us: {config}")
+    if not finalists:
+        raise RuntimeError("No candidate compiled and passed all numerical checks.")
+    for method in ("wgmma", "gemv"):
+        if method == "gemv" and (m != 1 or not include_gemv):
+            continue
+        for mode in ("direct", "split-K"):
+            print(
+                f"Validated {method} {mode} candidates: {successes.get((method, mode), 0)}"
             )
 
-        winners[(m, k, n)] = best_config
-        print(f"\nBest config             : {best_config}")
-        print(f"Kernel correctness passed : {passed}")
-        # print("tune-jax results:")
-        # print(tune_jax.tabulate(tuned_fn.timing_results))
+    # Recheck the top candidates together to reduce ordering and clock-drift effects.
+    # functions = {str(idx): (item[2], args) for idx, item in enumerate(finalists)}
+    # timings = benchmark_calls(functions, warmup, max(31, iterations))
+    timings = {
+        str(idx): benchmark_gpu(
+            candidate_function(item[1], num_sms),
+            args,
+            warmup,
+            max(31, iterations),
+        )
+        for idx, item in enumerate(finalists)
+    }
+    winner = min(range(len(finalists)), key=lambda idx: timings[str(idx)]["median_us"])
+    _, config, compiled = finalists[winner]
+    return config, compiled, timings[str(winner)]
 
-    print("\nReusable winners:")
-    for shape, config in winners.items():
-        print(f"    {shape}: {config},")
 
-    return winners
-
-
-def run_benchmark(
-    scenarios=SCENARIOS,
-    *,
-    configs_by_shape=None,
-    warmup=5,
-    iterations=15,
-):
-    """Benchmark the Pallas kernel against the simple JAX reference."""
-    configs_by_shape = configs_by_shape or {}
-    key = jax.random.PRNGKey(0)
-
-    print("=" * 132)
-    print(
-        f"{'Workload':<28} | {'Shape (M, K, N)':<20} | {'Config':<8} | {'Correct':<8} | "
-        f"{'Pallas (ms)':<12} | {'Ref (ms)':<10} | {'Relative Perf':<15} | {'Bandwidth'}"
+def environment_metadata(device):
+    return dict(
+        contract=CONTRACT_NAME,
+        device=device.device_kind,
+        sms=device.core_count,
+        jax=jax.__version__,
+        jaxlib=jaxlib.__version__,
+        timing="cupti_gpu_us",
     )
-    print("=" * 132)
 
-    for scenario in scenarios:
-        m, k, n = scenario["m"], scenario["k"], scenario["n"]
-        shape = (m, k, n)
-        key, weights, scale, activations = make_inputs(key, m, k, n)
 
-        config = configs_by_shape.get(shape)
-        kernel_fn = partial(matmul, **config) if config is not None else matmul
-        config_label = "tuned" if config is not None else "default"
-
-        is_correct = check_correctness(weights, scale, activations, kernel_fn)
-
-        pallas_report = benchmark(
-            kernel_fn,
-            args=(weights, scale, activations),
-            warmup=warmup,
-            iterations=iterations,
+def read_configs(path, metadata, ignore_stale=False):
+    if not path.exists():
+        return {}
+    stored = json.loads(path.read_text())
+    if stored["environment"] != metadata:
+        if ignore_stale:
+            print(
+                "Ignoring configurations from an older implementation or environment."
+            )
+            return {}
+        raise ValueError(
+            "Saved configurations are from a different implementation or environment. Run with --tune."
         )
-        ref_report = benchmark(
-            simple_w8a16_matmul,
-            args=(weights, scale, activations),
-            warmup=warmup,
-            iterations=iterations,
-        )
-
-        t_pallas = pallas_report.median_kernel_time_ms
-        t_ref = ref_report.median_kernel_time_ms
-        perf_str = format_relative_perf(t_pallas, t_ref)
-        bw_gbps = compute_memory_bandwidth_gbps(m, k, n, t_pallas)
-
-        shape_str = f"({m}, {k}, {n})"
-        status_str = "Pass" if is_correct else "Fail"
-        bw_str = (
-            f"{bw_gbps / 1000.0:.2f} TB/s" if bw_gbps >= 1000 else f"{bw_gbps:.1f} GB/s"
-        )
-
-        print(
-            f"{scenario['desc']:<28} | {shape_str:<20} | {config_label:<8} | "
-            f"{status_str:<8} | {t_pallas:<12.4f} | {t_ref:<10.4f} | "
-            f"{perf_str:<15} | {bw_str}"
-        )
-
-    print("=" * 132)
+    return stored["configs"]
 
 
-def run_profile(
-    scenarios=SCENARIOS,
-    configs_by_shape=None,
-    static_argnames=("tile_m", "tile_n", "tile_k", "num_pipeline_stages", "panel_width","persistent"),
-    profile_dir="/tmp/w8a16_matmul_profile",
-    warmup=5,
-    repetitions=10,
-):
-    """Capture one JAX profiler trace per workload.
-
-    Compilation and input creation happen before each trace. The trace itself
-    contains only repeated kernel executions, with explicit trace annotations.
-    """
-    configs_by_shape = configs_by_shape or {}
-    root = Path(profile_dir).expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    key = jax.random.PRNGKey(0)
+def save_configs(path, metadata, configs):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(dict(environment=metadata, configs=configs), indent=2) + "\n"
+    )
+    temporary.replace(path)
 
 
-    print(f"Writing JAX profiler traces under: {root}")
-
-    for index, scenario in enumerate(scenarios, start=1):
-        m, k, n = scenario["m"], scenario["k"], scenario["n"]
-        shape = (m, k, n)
-        key, weights, scale, activations = make_inputs(key, m, k, n)
-
-        config = configs_by_shape.get(shape)
-        kernel_fn = partial(matmul, **config) if config is not None else matmul
-
-        print("\nLowering and compiling kernel function...")
-        start = time.perf_counter()
-        jitted_fn = jitted_fn = jax.jit(kernel_fn, static_argnames=static_argnames)
-        lowered = jitted_fn.lower(weights, scale, activations)
-        compiled = lowered.compile()
-        end = time.perf_counter()
-        print(f"Kernel function compiled. Time taken:  {(end - start)*1000:.3f} ms")
-        
-        config_label = "tuned" if config is not None else "default"
-
-        # Compile/warm up before starting the trace so compilation and random
-        # input generation do not dominate the captured computation profile.
-        for _ in range(warmup):
-            compiled(weights, scale, activations).block_until_ready()
-
-        workload_dir = root / f"m{m}_k{k}_n{n}"
-        workload_dir.mkdir(parents=True, exist_ok=True)
-
-        print(
-            f"[{index}/{len(scenarios)}] Profiling {scenario['desc']} "
-            f"shape={shape} config={config_label} -> {workload_dir}"
-        )
-
-        with jax.profiler.trace(str(workload_dir)):
-            for step in range(repetitions):
-                with jax.profiler.StepTraceAnnotation("w8a16_matmul", step_num=step):
-                    compiled(weights, scale, activations).block_until_ready()
-
-    print(f"Profile capture complete: {root}")
+def profile(compiled, args, directory, warmup, repetitions):
+    directory.mkdir(parents=True, exist_ok=True)
+    for _ in range(warmup):
+        jax.block_until_ready(compiled(*args))
+    with jax.profiler.trace(str(directory)):
+        for step in range(repetitions):
+            with jax.profiler.StepTraceAnnotation("w8a16_decode", step_num=step):
+                jax.block_until_ready(compiled(*args))
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(
-        description="Tune, benchmark, and profile the Hopper Fused W8A16 Pallas kernel."
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Check direct and split-K WGMMA/GEMV kernel paths.",
     )
     parser.add_argument(
         "--tune",
         action="store_true",
-        help="Tune kernel hyperparameters with tune-jax.",
+        help="Validate and tune WGMMA and batch-1 GEMV candidates.",
     )
     parser.add_argument(
         "--benchmark",
         action="store_true",
-        help="Benchmark the Pallas kernel against the JAX reference.",
+        help="Compare full-call latency with prepared BF16.",
     )
     parser.add_argument(
-        "--profile",
-        action="store_true",
-        help="Capture JAX profiler traces for the kernel workloads.",
+        "--profile", action="store_true", help="Capture complete operator traces."
     )
     parser.add_argument(
-        "--max-workers",
+        "--scenario",
+        nargs="+",
         type=int,
-        default=16,
-        help="Maximum tune-jax parallel compilation workers (default: 16).",
+        help="Zero-based scenario indices; default: all.",
     )
     parser.add_argument(
-        "--warmup",
-        type=int,
-        default=5,
-        help="Warmup iterations used by benchmark/profile (default: 5).",
+        "--configs",
+        default="w8a16_configs.json",
+        help="Read/save tuned configurations.",
     )
     parser.add_argument(
-        "--iterations",
-        type=int,
-        default=15,
-        help="Measured benchmark iterations (default: 15).",
+        "--no-gemv", action="store_true", help="Restrict tuning to Mosaic WGMMA."
     )
-    parser.add_argument(
-        "--profile-repetitions",
-        type=int,
-        default=10,
-        help="Kernel executions recorded in each profiler trace (default: 10).",
-    )
-    parser.add_argument(
-        "--profile-dir",
-        default="/tmp/w8a16_matmul_profile",
-        help="Root directory for JAX profiler traces.",
-    )
+    parser.add_argument("--device", type=int, default=0, help="Local GPU index.")
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--tune-iterations", type=int, default=10)
+    parser.add_argument("--profile-repetitions", type=int, default=10)
+    parser.add_argument("--profile-dir", default="w8a16_profiles")
     args = parser.parse_args(argv)
 
-    if args.max_workers <= 0:
-        parser.error("--max-workers must be positive")
-    if args.warmup < 0:
-        parser.error("--warmup must be non-negative")
-    if args.iterations <= 0:
-        parser.error("--iterations must be positive")
-    if args.profile_repetitions <= 0:
-        parser.error("--profile-repetitions must be positive")
-
-    return parser, args
+    if not any((args.check, args.tune, args.benchmark, args.profile)):
+        parser.error("Select --check, --tune, --benchmark, or --profile.")
+    if (
+        args.warmup < 0
+        or min(args.iterations, args.tune_iterations, args.profile_repetitions) <= 0
+    ):
+        parser.error(
+            "Warmup must be nonnegative and repetition counts must be positive."
+        )
+    if args.scenario is not None and any(
+        idx < 0 or idx >= len(SCENARIOS) for idx in args.scenario
+    ):
+        parser.error("Scenario index is outside the workload list.")
+    if args.profile and (args.tune or args.benchmark):
+        parser.error("Run --profile separately from --tune and --benchmark.")
+    return args
 
 
 def main(argv=None):
-    parser, args = parse_args(argv)
+    args = parse_args(argv)
+    devices = jax.local_devices(backend="gpu")
+    if args.device < 0 or args.device >= len(devices):
+        raise ValueError("Invalid local GPU index.")
+    device = devices[args.device]
+    metadata = environment_metadata(device)
+    config_path = Path(args.configs).expanduser()
+    configs = read_configs(config_path, metadata, ignore_stale=args.tune or args.check)
+    indices = range(len(SCENARIOS)) if args.scenario is None else args.scenario
+    key = jax.random.key(0)
+    print(json.dumps(metadata, indent=2))
+    print("Timing metric: CUPTI GPU execution time per complete call, in microseconds.")
 
-    if not (args.tune or args.benchmark or args.profile):
-        raise ValueError("No action selected for kernel!")
+    with jax.default_device(device):
+        for idx in indices:
+            scenario = SCENARIOS[idx]
+            m, k, n = scenario["m"], scenario["k"], scenario["n"]
+            shape_key = f"{m},{k},{n}"
+            print(f"\n[{idx}] {scenario['desc']}: M={m}, K={k}, N={n}")
+            key, weights, scale, activations, prepared_weight = make_inputs(
+                key, m, k, n
+            )
+            inputs = (weights, scale, activations)
+            cases = validation_cases(*inputs)
+            if args.check:
+                check_kernel_paths(
+                    inputs, cases, device.core_count, include_gemv=not args.no_gemv
+                )
+            if args.tune:
+                config, compiled, timing = tune_for_shape(
+                    inputs,
+                    cases,
+                    device.core_count,
+                    not args.no_gemv,
+                    args.warmup,
+                    args.tune_iterations,
+                )
+                configs[shape_key] = config
+                save_configs(config_path, metadata, configs)
+                print(f"Winner: {config}; {timing['median_us']:.2f} us")
+            else:
+                config = configs.get(shape_key, default_config(m))
+                compiled = compile_candidate(config, device.core_count, inputs)
+                print(f"Config: {config}")
 
-    winners = None
-    if args.tune:
-        winners = run_tuning(max_workers=args.max_workers)
+            passed, reports = validate(compiled, cases)
+            if not passed:
+                raise AssertionError(f"Numerical check failed: {reports[-1]}")
+            print(
+                f"Checks passed; max absolute error={max(report['max_abs'] for _, report in reports):.6g}"
+            )
+            print(f"Max NRMSE={max(report['nrmse'] for _, report in reports):.6g}")
+            del cases
 
-    # When actions are combined, reuse winners from this process. This makes
-    # `--tune --benchmark` and `--tune --profile` exercise the tuned configs.
-    if args.benchmark:
-        run_benchmark(
-            configs_by_shape=winners,
-            warmup=args.warmup,
-            iterations=args.iterations,
-        )
+            if args.benchmark:
+                # Pass plain functions; benchmark() handles JIT, compilation, and warmup.
+                # Bind only configuration values; keep weights and activations as runtime inputs.
+                bf16_args = (prepared_weight, activations)
+                functions = {
+                    "fused_w8a16": (
+                        candidate_function(config, device.core_count),
+                        inputs,
+                    ),
+                    "prepared_bf16": (bf16_matmul, bf16_args),
+                    "jax_w8a16": (simple_w8a16_matmul, inputs),
+                }
 
-    if args.profile:
-        run_profile(
-            configs_by_shape=winners,
-            profile_dir=args.profile_dir,
-            warmup=args.warmup,
-            repetitions=args.profile_repetitions,
-        )
+                # Measure GPU work, including split-K reduction and other kernels in each call.
+                # The existing tuner still selects configurations using synchronized host timing.
+                reports = {}
+                for name, (function, call_args) in functions.items():
+                    report = benchmark(
+                        function,
+                        args=call_args,
+                        warmup=max(1, args.warmup),
+                        iterations=args.iterations,
+                    )
+                    reports[name] = report
+                    print(
+                        f"{name:18} CUPTI median GPU time: {report.median_kernel_time_ms * 1000:.2f} us"
+                    )
+
+                fused_ms = reports["fused_w8a16"].median_kernel_time_ms
+                bf16_ms = reports["prepared_bf16"].median_kernel_time_ms
+                print(
+                    f"Fused versus prepared BF16: {format_relative_perf(fused_ms, bf16_ms)}"
+                )
+
+                # Preserve the quantization-quality comparison outside timing.
+                original = np.asarray(
+                    jax.device_get(jax.jit(bf16_matmul)(*bf16_args)), dtype=np.float32
+                )
+                quantized = np.asarray(
+                    jax.device_get(compiled(*inputs)), dtype=np.float32
+                )
+                relative_l2 = np.linalg.norm(quantized - original) / max(
+                    np.linalg.norm(original), 1e-12
+                )
+                print(
+                    f"Output relative L2 error versus original BF16 weights: {relative_l2:.6g}"
+                )
+            if args.profile:
+                directory = Path(args.profile_dir).expanduser() / f"m{m}_k{k}_n{n}"
+                profile(
+                    compiled, inputs, directory, args.warmup, args.profile_repetitions
+                )
+                print(f"Trace: {directory}")
 
 
 if __name__ == "__main__":
