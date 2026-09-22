@@ -11,6 +11,8 @@ from jax.extend import backend
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from pallasforge.common import benchmark
+from pallasforge.common import profile_xprof
 from pallasforge.common import get_max_smem_bytes
 
 
@@ -22,7 +24,7 @@ def matmul(
     tile_k,
     num_pipeline_stages,
     panel_width,
-    is_persistent,
+    persistent,
 ):
     """Kernel for matrix multiplication of two matrices with bfloat16 dtype.
 
@@ -34,7 +36,7 @@ def matmul(
         tile_k: Size of the reduction step (K dimension).
         num_pipeline_stages: Number of reduction stages staged concurrently in SMEM.
         panel_width: Width (in tiles) of a vertical panel for swizzled L2 cache reuse.
-        is_persistent: If enabled, persistent GPU programs iterate over multiple output tiles.
+        persistent: If enabled, persistent GPU programs iterate over multiple output tiles.
 
     Returns:
         output of lhs @ rhs of bfloat16 dtype with shape (M, N).
@@ -172,7 +174,7 @@ def matmul(
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
         # Grid Dispatch: Persistent Worker Loop vs. 1-to-1 Threadblock Launch
-        if is_persistent:
+        if persistent:
 
             def persistent_loop_body(loop_info):
                 (tile_idx,) = loop_info.index
@@ -184,7 +186,7 @@ def matmul(
             compute_one_output_tile(tile_idx)
 
     # Launch Configuration & Compilation
-    if is_persistent:
+    if persistent:
         launch_grid = (backend.get_default_device().core_count,)
         grid_names = ("sm",)
     else:
@@ -225,16 +227,58 @@ def main(args):
         tile_n=args.tile_n,
         num_pipeline_stages=args.num_pipeline_stages,
         panel_width=args.panel_width,
-        is_persistent=args.is_persistent,
+        persistent=args.persistent,
     )
 
     out2 = jnp.matmul(lhs, rhs)
     print("Checking correctness ... ", end=" ")
     print(jnp.allclose(out1, out2, atol=1e-2, rtol=1e-2))
 
+    config = dict(
+        tile_m=args.tile_m,
+        tile_n=args.tile_n,
+        tile_k=args.tile_k,
+        num_pipeline_stages=args.num_pipeline_stages,
+        panel_width=args.panel_width,
+        persistent=args.persistent,
+    )
+    static_argnames = tuple(config)
+
+    if args.mode == "benchmark":
+        # benchmark function here compiles, warmup, and then passes
+        # compiled function directly to CUPTI
+        report = benchmark(
+            matmul,
+            args=(lhs, rhs),
+            kwargs=config,
+            static_argnames=static_argnames,
+            warmup=args.warmup,
+            iterations=args.iterations,
+        )
+        report.print_summary()
+    else:
+        # We need to compile and warmup the function before profiling
+        compiled = (
+            jax.jit(matmul, static_argnames=static_argnames)
+            .lower(lhs, rhs, **config)
+            .compile()
+        )
+        for _ in range(args.warmup):
+            jax.block_until_ready(compiled(lhs, rhs))
+
+        with profile_xprof(profile_dir=args.trace_dir, retain_trace=True) as stats:
+            for _ in range(args.iterations):
+                jax.block_until_ready(compiled(lhs, rhs))
+
+        print(f"Device time    : {stats['total_device_time_ms']:.4f} ms")
+        print(f"Trace saved at : {stats['trace_dir']}")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Arguments for bf16 matmul kernel")
+    parser = argparse.ArgumentParser(
+        description="Run, benchmark and profile bf16 matmul kernel"
+    )
+    parser.add_argument("mode", choices=("benchmark", "profile"))
     parser.add_argument("-m", default=64, type=int)
     parser.add_argument("-k", default=4096, type=int)
     parser.add_argument("-n", default=4096, type=int)
@@ -243,7 +287,15 @@ if __name__ == "__main__":
     parser.add_argument("--tile_k", default=128, type=int)
     parser.add_argument("--num_pipeline_stages", default=4, type=int)
     parser.add_argument("--panel_width", default=4, type=int)
-    parser.add_argument("--is_persistent", default=True, type=bool)
+    parser.add_argument("--persistent", default=True, type=bool)
+    parser.add_argument("--warmup", default=5, type=int)
+    parser.add_argument("--iterations", default=15, type=int)
+    parser.add_argument("--trace_dir", default="./traces", type=str)
 
-    arguments = parser.parse_args()
-    main(arguments)
+    args = parser.parse_args()
+    if args.warmup < 1 or args.iterations < 1:
+        parser.error(
+            "Values provided for warmup and iterations arguments must be positive!"
+        )
+
+    main(args)
