@@ -1,261 +1,271 @@
-import time
+import inspect
+import math
+import operator
 import pathlib
 import shutil
 import tempfile
-import dataclasses
+import time
+from dataclasses import dataclass
 from contextlib import contextmanager
-from typing import Any, Callable, Sequence
 
 import jax
-import jax.numpy as jnp
+import numpy as np
 from jax.extend import backend
 from jax.experimental.mosaic.gpu import profiler
-from xprof.cli.tools import get_kernel_stats_tool
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True)
 class BenchmarkReport:
-    """Container for compilation metrics and GPU hardware execution timings.
-
-    Attributes:
-        lower_time_ms: Wall-clock time taken to trace and lower the function into
-            HLO/StableHLO (in milliseconds).
-        compile_time_ms: Wall-clock time taken by XLA backend compilation into
-            machine code (in milliseconds).
-        peak_memory_mb: Static peak memory requirement of the compiled executable
-            in megabytes.
-        cupti_times_ms: Tuple of individual GPU device execution durations measured
-            via CUPTI (in milliseconds).
-    """
+    """Compilation costs, optional compiler memory estimate, and GPU timings."""
 
     lower_time_ms: float
     compile_time_ms: float
-    peak_memory_mb: float
+    peak_memory_mb: float | None
     cupti_times_ms: tuple[float, ...]
 
     @property
     def median_kernel_time_ms(self):
-        """Computes the median GPU execution time across measured iterations."""
-        return float(jnp.median(jnp.array(self.cupti_times_ms)))
+        return float(np.median(self.cupti_times_ms))
+
+    @property
+    def max_kernel_time_ms(self):
+        return float(np.max(self.cupti_times_ms))
+
+    @property
+    def min_kernel_time_ms(self):
+        return float(np.min(self.cupti_times_ms))
 
     def print_summary(self):
-        """Prints a formatted summary of the benchmark metrics."""
-        print(f"Lowering Time       :  {self.lower_time_ms:.3f} ms")
-        print(f"Compilation Time    :  {self.compile_time_ms:.3f} ms")
-        print(f"Peak Device Memory  :  {self.peak_memory_mb:.2f} MB")
-        print(f"Median Kernel Time  :  {self.median_kernel_time_ms:.4f} ms")
+        memory = (
+            "unavailable"
+            if self.peak_memory_mb is None
+            else f"{self.peak_memory_mb:.2f} MB"
+        )
+        print(f"Static Peak Memory  : {memory}\n")
+        print(f"Lowering Time       : {self.lower_time_ms:.3f} ms")
+        print(f"Compilation Time    : {self.compile_time_ms:.3f} ms\n")
+        print(f"Min GPU Time        : {self.min_kernel_time_ms:.4f} ms")
+        print(f"Max GPU Time        : {self.max_kernel_time_ms:.4f} ms")
+        print(f"Median GPU Time     : {self.median_kernel_time_ms:.4f} ms")
 
 
-def get_max_smem_bytes():
-    """Get the maximum available shared memory on a single device!"""
-    gpu = backend.get_default_device()
-    smem_bytes = getattr(gpu, "shared_memory_per_block_optin", None)
-    return int(smem_bytes) if smem_bytes else None
+def get_max_smem_bytes(device=None):
+    """Return the device's exposed per-block opt-in limit, or None if unavailable."""
+    device = backend.get_default_device() if device is None else device
+    if device.platform != "gpu":
+        raise ValueError("Shared-memory limits require a GPU device.")
+    limit = getattr(device, "shared_memory_per_block_optin", None)
+    return int(limit) if limit is not None and limit > 0 else None
 
 
-def format_relative_perf(t_kernel: float, t_ref: float) -> str:
-    """Formats relative performance as Nx faster or Nx slower."""
-    if t_kernel <= 0 or t_ref <= 0:
+def format_relative_perf(kernel_ms, reference_ms):
+    if not all(
+        math.isfinite(duration) and duration > 0
+        for duration in (kernel_ms, reference_ms)
+    ):
         return "N/A"
-
-    if t_kernel <= t_ref:
-        factor = t_ref / t_kernel
-        return f"{factor:.2f}x faster"
-    else:
-        factor = t_kernel / t_ref
-        return f"{factor:.2f}x slower"
+    if kernel_ms == reference_ms:
+        return "same speed"
+    if kernel_ms < reference_ms:
+        return f"{reference_ms / kernel_ms:.2f}x faster"
+    return f"{kernel_ms / reference_ms:.2f}x slower"
 
 
 def benchmark(
-    fn: Callable[..., Any],
+    function,
     *,
-    args: Sequence[Any] = (),
-    kwargs: dict[str, Any] | None = None,
-    static_argnames: str | Sequence[str] | None = None,
-    static_argnums: int | Sequence[int] | None = None,
-    warmup: int = 5,
-    iterations: int = 10,
-    **jit_kwargs: Any,
-) -> BenchmarkReport:
-    """JIT-compiles, lowers, and benchmarks a plain Python function using Cupti.
+    args=(),
+    kwargs=None,
+    static_argnames=None,
+    static_argnums=None,
+    warmup=5,
+    iterations=10,
+    **jit_kwargs,
+):
+    """Benchmark a plain, pure function on one local NVIDIA GPU.
 
-    This utility wraps a standard Python function with `jax.jit`, lowers it for
-    the provided inputs, compiles the executable, does static memory analysis,
-    and measures on-device kernel runtimes via NVIDIA CUPTI.
-
-    Args:
-        fn: Plain Python function to JIT, lower, compile, and benchmark.
-        args: Positional arguments to forward to `fn` (both dynamic arrays and
-            positional static values).
-        kwargs: Keyword arguments to forward to `fn` (both dynamic arrays and
-            keyword static configurations).
-        static_argnames: Names of keyword arguments that should be treated as
-            compile-time static constants.
-        static_argnums: Indices of positional arguments that should be treated as
-            compile-time static constants.
-        warmup: Number of warmup executions.
-        iterations: Number of timed executions to record using the CUPTI profiler.
-        **jit_kwargs: Additional options to pass to `jax.jit` (e.g., `donate_argnums`,
-            `inline=True`).
-
-    Returns:
-        A `BenchmarkReport` containing lowering duration, XLA compile time, static
-        peak device memory usage, and recorded CUPTI kernel durations.
-
-    Raises:
-        ValueError: If called on a non-GPU platform.
-        TypeError: If arguments provided in `args`/`kwargs` do not match `fn`'s signature.
-
-    Example:
-        >>> def tiled_reduction(x: jax.Array, tile_size: int, scale: float = 1.0):
-        ...   return jnp.sum(x.reshape(-1, tile_size), axis=0) * scale
-        ...
-        >>> data = jnp.ones((2048, 2048), dtype=jnp.float32)
-        >>> report = benchmark(
-        ...     tiled_reduction,
-        ...     args=(data,),
-        ...     kwargs={"tile_size": 64, "scale": 2.0},
-        ...     static_argnames=("tile_size",),
-        ...     warmup=3,
-        ...     iterations=15,
-        ... )
-        >>> report.print_summary()
+    Static argument options follow jax.jit exactly. At least one warmup is required.
+    Donation is unsupported because every execution reuses the same inputs.
+    Compilation times include any effects of JAX's compilation caches.
+    CUPTI uses finalize=False. Run XProf in a separate process.
     """
 
-    kwargs = kwargs or {}
+    warmup = operator.index(warmup)
+    iterations = operator.index(iterations)
+    if warmup < 1 or iterations < 1:
+        raise ValueError("warmup and iterations must both be at least 1.")
 
-    # 1. JIT compile the plain function with specified static args and options
-    jitted_fn = jax.jit(
-        fn,
+    for option in ("donate_argnums", "donate_argnames"):
+        donation = jit_kwargs.pop(option, None)
+        if donation is not None and np.size(donation):
+            raise ValueError(
+                "Donation is unsupported because benchmark inputs are reused."
+            )
+
+    args = tuple(args)
+    kwargs = {} if kwargs is None else dict(kwargs)
+
+    if static_argnums is not None:
+        static_argnums = tuple(
+            map(operator.index, np.atleast_1d(static_argnums).tolist())
+        )
+    if static_argnames is not None:
+        static_argnames = tuple(np.atleast_1d(static_argnames).tolist())
+
+    jitted = jax.jit(
+        function,
         static_argnames=static_argnames,
         static_argnums=static_argnums,
         **jit_kwargs,
     )
 
-    # 2. Lowering stage (traces into HLO / StableHLO IR)
-    t0 = time.perf_counter()
-    lowered = jitted_fn.lower(*args, **kwargs)
-    lower_time_ms = (time.perf_counter() - t0) * 1000.0
+    start = time.perf_counter()
+    lowered = jitted.lower(*args, **kwargs)
+    lower_ms = (time.perf_counter() - start) * 1000.0
 
-    # 3. XLA compilation stage (compiles HLO into GPU machine code)
-    t0 = time.perf_counter()
+    start = time.perf_counter()
     compiled = lowered.compile()
-    compile_time_ms = (time.perf_counter() - t0) * 1000.0
+    compile_ms = (time.perf_counter() - start) * 1000.0
 
-    # 4. Static peak device memory analysis
-    mem_info = compiled.memory_analysis()
-    peak_mem_mb = mem_info.peak_memory_in_bytes / 1e6 if mem_info is not None else 0.0
-
-    # 5. Warmup executions (lowered handles dynamic/static dispatch internally)
-    for _ in range(warmup):
-        compiled(*args).block_until_ready()
-
-    # 6. Device kernel runtime measurement with CUPTI
-    runner = profiler.Cupti(finalize=False).measure(compiled)
-
-    timings = []
-    for _ in range(iterations):
-        res, duration_ms = runner(*args)
-        res.block_until_ready()
-        timings.append(duration_ms)
-
-    return BenchmarkReport(
-        lower_time_ms=lower_time_ms,
-        compile_time_ms=compile_time_ms,
-        peak_memory_mb=peak_mem_mb,
-        cupti_times_ms=tuple(timings),
+    # Compiled calls omit static arguments. JAX infers positions from
+    # names only when argnums is None.
+    static_positions = set(static_argnums or ())
+    if static_argnums is None and static_argnames:
+        try:
+            parameters = inspect.signature(function).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        static_positions = {
+            index
+            for index, parameter in enumerate(parameters)
+            if parameter.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+            and parameter.name in static_argnames
+        }
+    static_positions = {
+        index if index >= 0 else len(args) + index for index in static_positions
+    }
+    call_args = tuple(
+        value for index, value in enumerate(args) if index not in static_positions
     )
+    # The compiled metadata already reflects JAX's static-name inference and retained keyword arguments.
+    call_kwargs = {name: kwargs[name] for name in compiled.args_info[1]}
+
+    # Inspect the actual executable target, which can differ from the default backend.
+    executable = compiled.runtime_executable()
+
+    if executable is None:
+        raise RuntimeError("The compiled executable is unavailable.")
+
+    devices = executable.local_devices()
+    if len(devices) != 1 or devices[0].platform != "gpu":
+        raise ValueError("This benchmark requires exactly one local NVIDIA GPU.")
+    if "cuda" not in devices[0].client.platform_version.lower():
+        raise ValueError("CUPTI requires an NVIDIA CUDA backend.")
+
+    # Memory analysis is a compiler estimate, not a live GPU memory measurement.
+    try:
+        memory = compiled.memory_analysis()
+    except NotImplementedError:
+        memory = None
+    peak_bytes = getattr(memory, "peak_memory_in_bytes", None)
+    peak_mb = peak_bytes / 1e6 if peak_bytes is not None and peak_bytes >= 0 else None
+
+    for iteration in range(warmup):
+        jax.block_until_ready(compiled(*call_args, **call_kwargs))
+
+    # Construct one timer and call it separately for each sample.
+    # Keep finalize=False; do not pass iterations to the CUPTI helper.
+    measure = profiler.Cupti(finalize=False).measure(compiled)
+    timings = []
+    for iteration in range(iterations):
+        duration = measure(*call_args, **call_kwargs)[1]
+        if duration is None:
+            raise RuntimeError("CUPTI recorded no kernel launches.")
+        duration = float(duration)
+        if not math.isfinite(duration) or duration <= 0:
+            raise RuntimeError("CUPTI returned no positive, finite GPU execution time.")
+        timings.append(duration)
+
+    return BenchmarkReport(lower_ms, compile_ms, peak_mb, tuple(timings))
 
 
 @contextmanager
-def profile_xprof(profile_dir=None, event_filter_regex=None):
-    """Profiles XLA device operations and collects XProf kernel statistics.
+def profile_xprof(profile_dir=None, event_filter_regex=None, retain_trace=False):
+    """Collect device timing and optionally retain the trace.
 
-    Creates a dedicated profiling run directory and records a JAX device trace
-    while the context manager body executes. After tracing completes, the
-    resulting XPlane trace is processed using XProf's kernel statistics tool.
-
-    Profiling artifacts are retained only after a successful run. If tracing or
-    post-processing fails, the run directory is removed so incomplete profiling
-    artifacts are not left behind.
-
-    The yielded dictionary is populated after the context manager body completes
-    successfully.
-
-    Args:
-        profile_dir: Parent directory in which to create the profiling run
-            directory. If not provided, a directory is created in the system
-            temporary directory. Defaults to `None`
-        event_filter_regex: Optional regular expression used to restrict which trace
-            events are included when computing kernel statistics.
-
-    Yields:
-        A mutable dictionary populated with profiling results after successful
-        completion. It contains:
-
-        - "total_device_time_ms": Total matched device execution time in milliseconds.
-        - "summary": Full dictionary returned by XProf kernel statistics.
-        - "trace_dir": Path to the retained profiling run directory.
-
-    Raises:
-        ValueError: If the active JAX backend is CPU.
-        RuntimeError: If profiling completes without producing an XPlane trace file.
-        Exception: Propagates exceptions raised by the profiled code or XProf
-            post-processing after cleaning up the incomplete run directory.
-
-    Example:
-        >>> with profile_xprof() as stats:
-        ...    result = jax.jit(fn)(inputs)
-        ...    jax.block_until_ready(result)
-        ...
-        >>> print(stats["total_device_time_ms"])
-        >>> print(stats["trace_dir"])
+    Compile and warm up before entering. Inside the context, call
+    jax.block_until_ready(result) for every output tree whose work must be captured.
+    Read the yielded dictionary only after leaving the context.
+    The trace is deleted unless retain_trace is True; then stats includes trace_dir.
+    Run this in a separate process from CUPTI benchmarks to isolate profiler state.
+    Do not nest this context with another profiling session.
     """
 
-    if jax.default_backend() == "cpu":
-        raise ValueError("XProf profiling requires GPU or TPU backend.")
+    if jax.default_backend() not in ("gpu", "tpu"):
+        raise ValueError("XProf profiling requires a GPU or TPU backend.")
 
-    if profile_dir is not None:
-        parent_path = pathlib.Path(profile_dir)
-        parent_path.mkdir(parents=True, exist_ok=True)
-        run_dir = pathlib.Path(tempfile.mkdtemp(prefix="run_", dir=parent_path))
-    else:
-        run_dir = pathlib.Path(tempfile.mkdtemp(prefix="xprof_profile_"))
+    from xprof.cli.tools import get_kernel_stats_tool
 
+    options = jax.profiler.ProfileOptions()
+    options.python_tracer_level = 0
+    options.host_tracer_level = 0
+    options.enable_hlo_proto = False
+    if jax.default_backend() == "tpu":
+        options.advanced_configuration = {
+            "tpu_trace_mode": "TRACE_ONLY_XLA",
+            "tpu_perf_counters": True,
+        }
+
+    parent = (
+        None
+        if profile_dir is None
+        else pathlib.Path(profile_dir).expanduser().resolve()
+    )
+    if parent is not None:
+        parent.mkdir(parents=True, exist_ok=True)
+
+    run_dir = pathlib.Path(tempfile.mkdtemp(prefix="xprof_profile_", dir=parent))
     stats = {}
-    completed = False
 
     try:
-        with jax.profiler.trace(str(run_dir)):
+        with jax.profiler.trace(str(run_dir), profiler_options=options):
             yield stats
 
         trace_files = list(run_dir.glob("**/*.xplane.pb"))
-        if not trace_files:
+        if len(trace_files) != 1:
             raise RuntimeError(
-                f"No profile trace file found in {run_dir}. Ensure device operations "
-                "were executed and blocked using `jax.block_until_ready()`."
+                f"Expected one XPlane trace, found {len(trace_files)} in {run_dir}."
             )
 
-        profile_data = jax.profiler.ProfileData.from_serialized_xspace(
+        profile = jax.profiler.ProfileData.from_serialized_xspace(
             trace_files[0].read_bytes()
         )
-
-        matchers = (event_filter_regex,) if event_filter_regex else None
+        matchers = None if event_filter_regex is None else (event_filter_regex,)
         summary = get_kernel_stats_tool.compute_kernel_stats(
-            profile_data,
+            profile,
             output_format="dict",
             include_summary=True,
             trace_matchers=matchers,
         )
 
-        device_time_us = summary.get("total_device_duration_us", 0.0)
+        if "total_device_duration_us" not in summary:
+            raise RuntimeError(
+                "XProf did not return total_device_duration_us; check your XProf version."
+            )
 
-        stats["total_device_time_ms"] = device_time_us / 1000.0
-        stats["summary"] = summary
-        stats["trace_dir"] = run_dir
+        duration_us = float(summary["total_device_duration_us"])
 
-        completed = True
+        if not math.isfinite(duration_us) or duration_us <= 0:
+            raise RuntimeError(
+                "No positive device time was captured. Check blocking and the event filter."
+            )
 
-    finally:
-        if not completed and run_dir.exists():
-            shutil.rmtree(run_dir)
+        # The metric merges overlapping device intervals and excludes gaps.
+        stats.update(total_device_time_ms=duration_us / 1000.0, summary=summary)
+        if retain_trace:
+            stats["trace_dir"] = run_dir
+        else:
+            shutil.rmtree(run_dir, ignore_errors=True)
+    except BaseException:
+        # Cleanup must not hide the original tracing or user-code exception.
+        shutil.rmtree(run_dir, ignore_errors=True)
