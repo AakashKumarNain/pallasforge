@@ -38,7 +38,7 @@ Tutorials are provided as a reference for starters along with educational materi
     - Matrix Multiplication
         - [Overview and Fundamentals](./pallasforge/hopper/matmul/hopper-wgmma-pipeline.md)
         - [Basic Matrix Multiplication (BF16 @ BF16)](./pallasforge/hopper/matmul/bf16_matmul.py)
-        - [Quantized Matrix Multiplication (W8 @ A16 with Fused Dequantization)](./pallasforge/hopper/matmul/fused_w8a16.py)
+        - [Quantized Matrix Multiplication (W8 @ A16 with Fused Dequantization)](./pallasforge/hopper/matmul/w8a16.py)
 
 2. **Blackwell (B100, B200)**
 
