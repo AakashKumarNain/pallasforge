@@ -11,9 +11,16 @@ from jax.extend import backend
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+import tune_jax
+from tune_jax import tune, tune_logger
+
 from pallasforge.common import benchmark
 from pallasforge.common import profile_xprof
 from pallasforge.common import get_max_smem_bytes
+from pallasforge.common import format_relative_perf
+
+
+tune_logger.setLevel("INFO")
 
 
 def matmul(
@@ -110,7 +117,8 @@ def matmul(
             # -------------------------------------------------------------------
             # Swizzled 1D -> 2D Panel Rasterization:
             # Traverses the matrix in vertical "Panels" using a snake-like path
-            # to maximize L2 cache hit rates on rhs columns.
+            # to maximize L2 cache hit rates on rhs columns. Look at the tutorial video to
+            # understand how this works in practice
             # -------------------------------------------------------------------
             tiles_per_panel = num_tiles_m * panel_width
 
@@ -212,6 +220,10 @@ def matmul(
     )(lhs, rhs)
 
 
+def jax_matmul(lhs, rhs):
+    return jnp.matmul(lhs, rhs)
+
+
 def main(args):
     key = jax.random.PRNGKey(0)
     key, lhs_key, rhs_key = jax.random.split(key, 3)
@@ -230,9 +242,11 @@ def main(args):
         persistent=args.persistent,
     )
 
-    out2 = jnp.matmul(lhs, rhs)
-    print("Checking correctness ... ", end=" ")
-    print(jnp.allclose(out1, out2, atol=1e-2, rtol=1e-2))
+    out2 = jax_matmul(lhs, rhs)
+
+    if args.check:
+        print("Checking correctness ... ", end=" ")
+        print(jnp.allclose(out1, out2, atol=1e-2, rtol=1e-2))
 
     config = dict(
         tile_m=args.tile_m,
@@ -244,19 +258,71 @@ def main(args):
     )
     static_argnames = tuple(config)
 
-    if args.mode == "benchmark":
-        # benchmark function here compiles, warmup, and then passes
-        # compiled function directly to CUPTI
+    if args.tune:
+        hyperparams = dict(
+            tile_m=[64, 128, 256],
+            tile_n=[64, 128, 256],
+            tile_k=[64, 128],
+            num_pipeline_stages=[2, 3, 4, 5],
+            panel_width=[1, 2, 4, 8],
+            persistent=[True, False],
+        )
+
+        # Configs that raise ValueError in matmul (bad divisibility, SMEM or register overflow) fail to compile.
+        # tune skips them and keeps the rest.
+        tuned_matmul = jax.jit(tune(matmul, hyperparams=hyperparams))
+
+        tuned_matmul(
+            lhs, rhs
+        ).block_until_ready()  # first call per input shape runs the tuning
+        print(tune_jax.tabulate(tuned_matmul))  # all configs, sorted by mean time
+        print("\n\nOptimal config :", tuned_matmul.optimal_hyperparams)
+        best_config = dict(tuned_matmul.optimal_hyperparams)
+
+    if args.benchmark:
+        if args.tune:
+            # benchmark function here compiles, warmup, and then passes
+            # compiled function directly to CUPTI
+            report = benchmark(
+                matmul,
+                args=(lhs, rhs),
+                kwargs=best_config,
+                static_argnames=static_argnames,
+                warmup=args.warmup,
+                iterations=args.iterations,
+            )
+        else:
+            print(
+                "Running with default hyperparams. You may want to use `--tune` to tune the kernel for proper benchmarking"
+            )
+            report = benchmark(
+                matmul,
+                args=(lhs, rhs),
+                kwargs=config,
+                static_argnames=static_argnames,
+                warmup=args.warmup,
+                iterations=args.iterations,
+            )
+        print("\nKernel matmul report:")
+        report.print_summary()
+        kernel_matmul_median_ms = report.median_kernel_time_ms
+
         report = benchmark(
-            matmul,
+            jax_matmul,
             args=(lhs, rhs),
-            kwargs=config,
-            static_argnames=static_argnames,
             warmup=args.warmup,
             iterations=args.iterations,
         )
+        print("\n", "=" * 50)
+        print("JAX-native matmul report:")
         report.print_summary()
-    else:
+        print("\n")
+        jax_matmul_median_ms = report.median_kernel_time_ms
+        print(
+            f"The kernel is {format_relative_perf(kernel_matmul_median_ms, jax_matmul_median_ms)}"
+        )
+
+    if args.profile:
         # We need to compile and warmup the function before profiling
         compiled = (
             jax.jit(matmul, static_argnames=static_argnames)
@@ -278,7 +344,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Run, benchmark and profile bf16 matmul kernel"
     )
-    parser.add_argument("mode", choices=("benchmark", "profile"))
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Check correctness of the kernel with a reference",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Benchmark the kernel against a reference",
+    )
+    parser.add_argument(
+        "--tune", action="store_true", help="Tune the kernel hyperparams"
+    )
+    parser.add_argument("--profile", action="store_true", help="Kernel profiling")
     parser.add_argument("-m", default=64, type=int)
     parser.add_argument("-k", default=4096, type=int)
     parser.add_argument("-n", default=4096, type=int)
@@ -287,7 +366,9 @@ if __name__ == "__main__":
     parser.add_argument("--tile_k", default=128, type=int)
     parser.add_argument("--num_pipeline_stages", default=4, type=int)
     parser.add_argument("--panel_width", default=4, type=int)
-    parser.add_argument("--persistent", default=True, type=bool)
+    parser.add_argument(
+        "--persistent", default=True, action=argparse.BooleanOptionalAction
+    )
     parser.add_argument("--warmup", default=5, type=int)
     parser.add_argument("--iterations", default=15, type=int)
     parser.add_argument("--trace_dir", default="./traces", type=str)
