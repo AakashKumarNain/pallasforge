@@ -38,8 +38,13 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+import tune_jax
+from tune_jax import tune, tune_logger
+
 from pallasforge.common import benchmark
 from pallasforge.common import format_relative_perf
+
+tune_logger.setLevel("INFO")
 
 
 # The Q example is a single projection; gate/up shapes each describe one projection.
@@ -625,65 +630,114 @@ def benchmark_gpu(function, inputs, warmup=5, iterations=31):
     return {"median_us": report.median_kernel_time_ms * 1000.0}
 
 
-def tune_for_shape(args, cases, num_sms, include_gemv=True, warmup=3, iterations=15):
-    weights, _, activations = args
+def tunable_w8a16(
+    weights,
+    scale,
+    activations,
+    method,
+    tile_m,
+    tile_n,
+    tile_k,
+    num_pipeline_stages,
+    panel_width,
+    persistent,
+    split_k,
+    num_sms,
+):
+    # tune-jax tries every combination of the grid. Raising here marks a combination as failed, so tune skips it.
+    # These checks replace the pruning that enumerate_configs used to do.
     m, k = activations.shape
-    configs = enumerate_configs(m, k, weights.shape[0], num_sms, include_gemv)
-    np.random.default_rng(0).shuffle(configs)
-    finalists = []
-    successes = {}
-    print(f"Checking and timing {len(configs)} candidates.")
-    for index, config in enumerate(configs, 1):
-        try:
-            compiled = compile_candidate(config, num_sms, args)
-        except Exception as error:
-            # Compilation failures are safe to reject. Runtime CUDA errors are not caught.
-            print(f"[{index}/{len(configs)}] compile rejected: {config}\n{error}")
-            continue
-        passed, reports = validate(compiled, cases)
-        if not passed:
-            print(
-                f"[{index}/{len(configs)}] numerical rejection: {config}: {reports[-1]}"
-            )
-            continue
-        path = (config["method"], "split-K" if config["split_k"] > 1 else "direct")
-        successes[path] = successes.get(path, 0) + 1
-        # timing = benchmark_calls({"candidate": (compiled, args)}, warmup, iterations)["candidate"]
-        timing = benchmark_gpu(
-            candidate_function(config, num_sms),
-            args,
-            warmup,
-            iterations,
-        )
-        finalists.append((timing["median_us"], config, compiled))
-        finalists.sort(key=lambda item: item[0])
-        finalists = finalists[:3]
-        print(f"[{index}/{len(configs)}] {timing['median_us']:.2f} us: {config}")
-    if not finalists:
-        raise RuntimeError("No candidate compiled and passed all numerical checks.")
-    for method in ("wgmma", "gemv"):
-        if method == "gemv" and (m != 1 or not include_gemv):
-            continue
-        for mode in ("direct", "split-K"):
-            print(
-                f"Validated {method} {mode} candidates: {successes.get((method, mode), 0)}"
-            )
+    n = weights.shape[0]
+    if n % tile_n or k % (tile_k * split_k):
+        raise ValueError("Tiles do not cover N and K exactly.")
 
-    # Recheck the top candidates together to reduce ordering and clock-drift effects.
-    # functions = {str(idx): (item[2], args) for idx, item in enumerate(finalists)}
-    # timings = benchmark_calls(functions, warmup, max(31, iterations))
-    timings = {
-        str(idx): benchmark_gpu(
-            candidate_function(item[1], num_sms),
-            args,
-            warmup,
-            max(31, iterations),
+    if method == "gemv":
+        # GEMV ignores these four; allow only the first grid value of each so one kernel is not timed many times
+        if (tile_m, num_pipeline_stages, panel_width, persistent) != (
+            default_tile_m(m),
+            2,
+            1,
+            False,
+        ):
+            raise ValueError("Duplicate GEMV candidate.")
+        return gemv(
+            weights, scale, activations, tile_n=tile_n, tile_k=tile_k, split_k=split_k
         )
-        for idx, item in enumerate(finalists)
-    }
-    winner = min(range(len(finalists)), key=lambda idx: timings[str(idx)]["median_us"])
-    _, config, compiled = finalists[winner]
-    return config, compiled, timings[str(winner)]
+
+    tiles_m, tiles_n = pl.cdiv(m, tile_m), n // tile_n
+    k_steps = k // (tile_k * split_k)
+    if tile_k > 256:
+        raise ValueError("tile_k=512 is GEMV-only.")
+    if num_pipeline_stages > max(k_steps, 2):
+        raise ValueError(
+            "matmul clamps stages to k_steps; this would duplicate a smaller stage count."
+        )
+    if persistent and split_k * tiles_m * tiles_n <= num_sms:
+        raise ValueError("Fewer tasks than SMs; persistent adds nothing.")
+    if panel_width > 1 and (tiles_m == 1 or panel_width > tiles_n):
+        raise ValueError("Panel swizzle has no effect for this tile grid.")
+    return matmul(
+        weights,
+        scale,
+        activations,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        num_pipeline_stages=num_pipeline_stages,
+        panel_width=panel_width,
+        persistent=persistent,
+        split_k=split_k,
+        num_sms=num_sms,
+    )
+
+
+def tune_for_shape(args, num_sms, include_gemv=True, warmup=3, iterations=15):
+    _, _, activations = args
+    m = activations.shape[0]
+    base_m = default_tile_m(m)
+
+    hyperparams = dict(
+        method=["wgmma", "gemv"] if m == 1 and include_gemv else ["wgmma"],
+        tile_m=sorted({base_m, min(64, 2 * base_m)}),
+        tile_n=[64, 128],
+        tile_k=[128, 256, 512],
+        num_pipeline_stages=[2, 3, 4],
+        panel_width=[1, 4],
+        persistent=[False, True],
+        split_k=[1, 2, 4, 8],
+    )
+
+    tune_logger.setLevel("INFO")
+    # example_args: tune on the real INT8 weights and scales rather than on generated inputs
+    tuned = jax.jit(
+        tune(
+            partial(tunable_w8a16, num_sms=num_sms),
+            hyperparams=hyperparams,
+            example_args=args,
+        )
+    )
+    jax.block_until_ready(tuned(*args))  # first call runs the tuning
+    print(tune_jax.tabulate(tuned))
+
+    best = dict(tuned.optimal_hyperparams)
+    if (
+        best["method"] == "gemv"
+    ):  # keep the saved config in the format candidate_function expects
+        config = dict(
+            method="gemv",
+            tile_n=best["tile_n"],
+            tile_k=best["tile_k"],
+            split_k=best["split_k"],
+        )
+    else:
+        config = best
+
+    compiled = compile_candidate(config, num_sms, args)
+    # Re-time the winner with CUPTI so the reported number matches metadata["timing"]
+    timing = benchmark_gpu(
+        candidate_function(config, num_sms), args, warmup, max(31, iterations)
+    )
+    return config, compiled, timing
 
 
 def environment_metadata(device):
@@ -822,17 +876,13 @@ def main(argv=None):
                     inputs, cases, device.core_count, include_gemv=not args.no_gemv
                 )
             if args.tune:
-                config, compiled, timing = tune_for_shape(
+                config, compiled, _ = tune_for_shape(
                     inputs,
-                    cases,
                     device.core_count,
                     not args.no_gemv,
                     args.warmup,
                     args.tune_iterations,
                 )
-                configs[shape_key] = config
-                save_configs(config_path, metadata, configs)
-                print(f"Winner: {config}; {timing['median_us']:.2f} us")
             else:
                 config = configs.get(shape_key, default_config(m))
                 compiled = compile_candidate(config, device.core_count, inputs)
