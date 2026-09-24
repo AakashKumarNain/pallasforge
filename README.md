@@ -44,6 +44,37 @@ Tutorials are provided as a reference for starters along with educational materi
 
 <br><br>
 
+## Setting up the env and running examples
+
+We recommend using `uv` for managing the virtual environment and dependencies. You can install `uv`
+as per the [official instructions](https://docs.astral.sh/uv/getting-started/installation/). Once `uv` is set,
+you can create a virtual environment and install dependencies as shown below:
+
+```shell
+# Clone the repo
+git clone https://github.com/AakashKumarNain/pallasforge.git
+cd pallasforge/
+
+# Create venv and install dependencies
+uv sync
+source .venv/bin/activate
+```
+
+You can then run the given examples like this:
+
+```shell
+# Run the kernel and check correctness against the reference
+python -m pallasforge.hopper.matmul.bf16_matmul --check 
+
+# Run the kernel, tune the hyperparameters and benchmark it against the reference
+python -m pallasforge.hopper.matmul.bf16_matmul --tune --benchmark
+
+# Profile the kernel using xprof
+python -m pallasforge.hopper.matmul.bf16_matmul --profile
+# you can take a look at the kernel stats in traces by running xprof
+xprof <your_trace_dir>
+```
+
 ---
 
 <br>
