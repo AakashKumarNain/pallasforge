@@ -15,6 +15,7 @@ Tuning validates each candidate before timing it; a GPU execution error aborts.
 
 Examples:
     python w8a16_decode.py --check --scenario 0
+     python w8a16_decode.py --tune --tune-method auto --benchmark --scenario 0
     python w8a16_decode.py --tune --benchmark --configs w8a16_configs.json
     python w8a16_decode.py --profile --configs w8a16_configs.json
     MOSAIC_GPU_DUMP_PTXAS=1 python w8a16_decode.py --tune --scenario 0
@@ -166,7 +167,6 @@ def reduce_split_k(partials, scale, m, split_k):
             scale_gmem.at[cols], layout=row_layout, optimized=False
         ).astype(jnp.float32)
         result = (result * channel_scale).astype(jnp.bfloat16)
-        # Mosaic stores use Ref assignment; there is no plgpu.store function.
         out_gmem[row, cols] = result
 
     return plgpu.kernel(
@@ -259,7 +259,8 @@ def matmul(
                     q = plgpu.layout_cast(q, plgpu.Layout.WGMMA).astype(jnp.bfloat16)
                     plgpu.wgmma(acc, q, a_smem.T)
                     # Wait before registers or activation SMEM can be reused.
-                    # Changing this to 1 requires a different, verified operand schedule.
+                    # This is because our left operand is in the registers. We cannot
+                    # do overlapping here.
                     plgpu.wgmma_wait(0)
 
                 specs = (
@@ -294,9 +295,7 @@ def matmul(
                 result *= jax.lax.broadcast_in_dim(channel_scale, result.shape, (0,))
                 # Retain the working BF16 transpose/store path only for the final output.
                 result = result.astype(jnp.bfloat16)
-                out_smem.T[...] = plgpu.layout_cast(
-                    result, plgpu.Layout.WGMMA_TRANSPOSED
-                )
+                out_smem.T[...] = plgpu.layout_cast(result, plgpu.Layout.WGMMA_TRANSPOSED)  # fmt: off
                 plgpu.commit_smem()
                 rows = pl.ds(row_idx * tile_m, tile_m)
                 cols = pl.ds(col_idx * tile_n, tile_n)
@@ -316,6 +315,7 @@ def matmul(
             plgpu.nd_loop((split_k * output_tiles,), collective_axes="worker")(worker)
         else:
             compute_tile(jax.lax.axis_index("output_tile"))
+
         # Drain all stores before leaving the kernel, after allowing SMEM reuse above.
         if split_k == 1:
             plgpu.wait_smem_to_gmem(0)
@@ -346,78 +346,10 @@ def matmul(
     return reduce_split_k(result, scale, m, split_k)
 
 
-def gemv(weights, scale, activations, tile_n=64, tile_k=256, split_k=1):
-    """Batch-1 Mosaic kernel using FP32 vector arithmetic, without WGMMA operations."""
-
-    m, k, n = check_shapes(weights, scale, activations)
-
-    if m != 1 or min(tile_n, tile_k, split_k) <= 0:
-        raise ValueError("GEMV requires M=1 and positive tile sizes and split_k.")
-    if tile_n % 64 or tile_k % 128:
-        raise ValueError(
-            "GEMV uses tiles with N divisible by 64 and K divisible by 128."
-        )
-    if n % tile_n or k % (tile_k * split_k):
-        raise ValueError("GEMV requires exact N and K tile coverage.")
-
-    steps = k // (tile_k * split_k)
-    output_dtype = jnp.bfloat16 if split_k == 1 else jnp.float32
-    output_shape = (1, n) if split_k == 1 else (split_k * n, 1)
-    row_layout = plgpu.Layout.WGMMA.reduce(1)
-    column_layout = plgpu.Layout.WGMMA.reduce(0)
-
-    def kernel(q_gmem, scale_gmem, a_gmem, out_gmem):
-        channel_start = jax.lax.axis_index("channel_tile") * tile_n
-        split_idx = jax.lax.axis_index("split")
-        channels = pl.ds(channel_start, tile_n)
-        initial = plgpu.layout_cast(jnp.zeros((tile_n,), jnp.float32), row_layout)
-
-        def step(ki, acc):
-            cols = pl.ds((split_idx * steps + ki) * tile_k, tile_k)
-            # Use one common register layout for multiplication and row reduction.
-            # The layout name does not issue a WGMMA instruction or pad activation rows.
-            q = plgpu.load(
-                q_gmem.at[channels, cols], layout=plgpu.Layout.WGMMA, optimized=False
-            )
-            q = q.astype(jnp.float32)
-            a = plgpu.load(
-                a_gmem.at[0, cols], layout=column_layout, optimized=False
-            ).astype(jnp.float32)
-            a = jax.lax.broadcast_in_dim(a, (tile_n, tile_k), (1,))
-            return acc + jnp.sum(q * a, axis=1, dtype=jnp.float32)
-
-        result = jax.lax.fori_loop(0, steps, step, initial)
-        if split_k == 1:
-            channel_scale = plgpu.load(
-                scale_gmem.at[channels], layout=row_layout, optimized=False
-            )
-            result = (result * channel_scale.astype(jnp.float32)).astype(jnp.bfloat16)
-            out_gmem[0, channels] = result
-        else:
-            partial_channels = pl.ds(split_idx * n + channel_start, tile_n)
-            out_gmem[partial_channels, 0] = result
-
-    result = plgpu.kernel(
-        kernel,
-        out_type=jax.ShapeDtypeStruct(output_shape, output_dtype),
-        grid=(n // tile_n, split_k),
-        grid_names=("channel_tile", "split"),
-        compiler_params=plgpu.CompilerParams(approx_math=False),
-        kernel_name="hopper_w8a16_gemv",
-    )(weights, scale, activations)
-    if split_k == 1:
-        return result
-    return reduce_split_k(result, scale, 1, split_k)
-
-
 def candidate_function(config, num_sms):
     params = dict(config)
-    method = params.pop("method")
-    if method == "gemv":
-        return partial(gemv, **params)
-    if method == "wgmma":
-        return partial(matmul, num_sms=num_sms, **params)
-    raise ValueError(f"Unknown method: {method}")
+    _ = params.pop("method")
+    return partial(matmul, num_sms=num_sms, **params)
 
 
 def default_config(m):
@@ -477,10 +409,6 @@ def enumerate_configs(m, k, n, num_sms, include_gemv=True):
             if identity not in seen:
                 seen.add(identity)
                 configs.append(config)
-    if m == 1 and include_gemv:
-        for tn, tk, split in product((64, 128), (128, 256, 512), (1, 2, 4, 8)):
-            if n % tn == 0 and k % (tk * split) == 0:
-                configs.append(dict(method="gemv", tile_n=tn, tile_k=tk, split_k=split))
     if not configs:
         raise ValueError(f"No configurations cover {(m, k, n)}.")
     return configs
@@ -601,16 +529,14 @@ def check_kernel_paths(args, cases, num_sms, include_gemv=True):
     _, _, activations = args
     m, k = activations.shape
     configurations = []
+
     for split_k in (1, 2):
         if k % (128 * split_k):
             continue
         config = default_config(m)
         config.update(tile_k=128, split_k=split_k, num_pipeline_stages=2)
         configurations.append(config)
-        if m == 1 and include_gemv:
-            configurations.append(
-                dict(method="gemv", tile_n=64, tile_k=128, split_k=split_k)
-            )
+
     for config in configurations:
         print(f"Checking kernel path: {config}", flush=True)
         compiled = compile_candidate(config, num_sms, args)
@@ -651,19 +577,6 @@ def tunable_w8a16(
     if n % tile_n or k % (tile_k * split_k):
         raise ValueError("Tiles do not cover N and K exactly.")
 
-    if method == "gemv":
-        # GEMV ignores these four; allow only the first grid value of each so one kernel is not timed many times
-        if (tile_m, num_pipeline_stages, panel_width, persistent) != (
-            default_tile_m(m),
-            2,
-            1,
-            False,
-        ):
-            raise ValueError("Duplicate GEMV candidate.")
-        return gemv(
-            weights, scale, activations, tile_n=tile_n, tile_k=tile_k, split_k=split_k
-        )
-
     tiles_m, tiles_n = pl.cdiv(m, tile_m), n // tile_n
     k_steps = k // (tile_k * split_k)
     if tile_k > 256:
@@ -691,13 +604,13 @@ def tunable_w8a16(
     )
 
 
-def tune_for_shape(args, num_sms, include_gemv=True, warmup=3, iterations=15):
+def tune_for_shape_auto(args, num_sms, warmup=3, iterations=15):
     _, _, activations = args
     m = activations.shape[0]
     base_m = default_tile_m(m)
 
     hyperparams = dict(
-        method=["wgmma", "gemv"] if m == 1 and include_gemv else ["wgmma"],
+        method=["wgmma"],
         tile_m=sorted({base_m, min(64, 2 * base_m)}),
         tile_n=[64, 128],
         tile_k=[128, 256, 512],
@@ -719,25 +632,70 @@ def tune_for_shape(args, num_sms, include_gemv=True, warmup=3, iterations=15):
     jax.block_until_ready(tuned(*args))  # first call runs the tuning
     print(tune_jax.tabulate(tuned))
 
-    best = dict(tuned.optimal_hyperparams)
-    if (
-        best["method"] == "gemv"
-    ):  # keep the saved config in the format candidate_function expects
-        config = dict(
-            method="gemv",
-            tile_n=best["tile_n"],
-            tile_k=best["tile_k"],
-            split_k=best["split_k"],
-        )
-    else:
-        config = best
-
+    config = dict(tuned.optimal_hyperparams)
     compiled = compile_candidate(config, num_sms, args)
     # Re-time the winner with CUPTI so the reported number matches metadata["timing"]
     timing = benchmark_gpu(
         candidate_function(config, num_sms), args, warmup, max(31, iterations)
     )
     return config, compiled, timing
+
+
+def tune_for_shape_manual(args, cases, num_sms, warmup=3, iterations=15):
+    weights, _, activations = args
+    m, k = activations.shape
+    configs = enumerate_configs(m, k, weights.shape[0], num_sms)
+    np.random.default_rng(0).shuffle(configs)
+    finalists = []
+    successes = {}
+    print(f"Checking and timing {len(configs)} candidates.")
+    for index, config in enumerate(configs, 1):
+        try:
+            compiled = compile_candidate(config, num_sms, args)
+        except Exception as error:
+            # Compilation failures are safe to reject. Runtime CUDA errors are not caught.
+            print(f"[{index}/{len(configs)}] compile rejected: {config}\n{error}")
+            continue
+        passed, reports = validate(compiled, cases)
+        if not passed:
+            print(
+                f"[{index}/{len(configs)}] numerical rejection: {config}: {reports[-1]}"
+            )
+            continue
+        path = (config["method"], "split-K" if config["split_k"] > 1 else "direct")
+        successes[path] = successes.get(path, 0) + 1
+        # timing = benchmark_calls({"candidate": (compiled, args)}, warmup, iterations)["candidate"]
+        timing = benchmark_gpu(
+            candidate_function(config, num_sms),
+            args,
+            warmup,
+            iterations,
+        )
+        finalists.append((timing["median_us"], config, compiled))
+        finalists.sort(key=lambda item: item[0])
+        finalists = finalists[:3]
+        print(f"[{index}/{len(configs)}] {timing['median_us']:.2f} us: {config}")
+    if not finalists:
+        raise RuntimeError("No candidate compiled and passed all numerical checks.")
+    method = "wgmma"
+    for mode in ("direct", "split-K"):
+        print(
+            f"Validated {method} {mode} candidates: {successes.get((method, mode), 0)}"
+        )
+
+    # Recheck the top candidates together to reduce ordering and clock-drift effects.
+    timings = {
+        str(idx): benchmark_gpu(
+            candidate_function(item[1], num_sms),
+            args,
+            warmup,
+            max(31, iterations),
+        )
+        for idx, item in enumerate(finalists)
+    }
+    winner = min(range(len(finalists)), key=lambda idx: timings[str(idx)]["median_us"])
+    _, config, compiled = finalists[winner]
+    return config, compiled, timings[str(winner)]
 
 
 def environment_metadata(device):
@@ -757,12 +715,10 @@ def read_configs(path, metadata, ignore_stale=False):
     stored = json.loads(path.read_text())
     if stored["environment"] != metadata:
         if ignore_stale:
-            print(
-                "Ignoring configurations from an older implementation or environment."
-            )
+            print("Ignoring configurations from an older implementation or env.")
             return {}
         raise ValueError(
-            "Saved configurations are from a different implementation or environment. Run with --tune."
+            "Saved configurations are from a different implementation or env. Run with --tune."
         )
     return stored["configs"]
 
@@ -799,6 +755,12 @@ def parse_args(argv=None):
         help="Validate and tune WGMMA and batch-1 GEMV candidates.",
     )
     parser.add_argument(
+        "--tune-method",
+        choices=("auto", "manual"),
+        default="manual",
+        help="Whether to use tune-jax for tuning or not",
+    )
+    parser.add_argument(
         "--benchmark",
         action="store_true",
         help="Compare full-call latency with prepared BF16.",
@@ -817,9 +779,7 @@ def parse_args(argv=None):
         default="w8a16_configs.json",
         help="Read/save tuned configurations.",
     )
-    parser.add_argument(
-        "--no-gemv", action="store_true", help="Restrict tuning to Mosaic WGMMA."
-    )
+
     parser.add_argument("--device", type=int, default=0, help="Local GPU index.")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
@@ -876,13 +836,25 @@ def main(argv=None):
                     inputs, cases, device.core_count, include_gemv=not args.no_gemv
                 )
             if args.tune:
-                config, compiled, _ = tune_for_shape(
-                    inputs,
-                    device.core_count,
-                    not args.no_gemv,
-                    args.warmup,
-                    args.tune_iterations,
-                )
+                if args.tune_method == "auto":
+                    config, compiled, timing = tune_for_shape_auto(
+                        inputs,
+                        device.core_count,
+                        args.warmup,
+                        args.tune_iterations,
+                    )
+                else:
+                    config, compiled, timing = tune_for_shape_manual(
+                        inputs,
+                        cases,
+                        device.core_count,
+                        args.warmup,
+                        args.tune_iterations,
+                    )
+
+                configs[shape_key] = config
+                save_configs(config_path, metadata, configs)
+                print(f"Winner: {config}; {timing['median_us']:.2f} us")
             else:
                 config = configs.get(shape_key, default_config(m))
                 compiled = compile_candidate(config, device.core_count, inputs)
