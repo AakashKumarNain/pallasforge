@@ -15,7 +15,8 @@ pallasforge/
 ├── docs
 │   ├── GUIDELINES.md                   # Contributor guide / style guide
 │   └── PROPOSALS.md                    # Future kernel RFCs / roadmap
-├── examples
+├── notes                               # Learning material
+├── media                               # Images, videos used in learning material
 ├── LICENSE
 ├── pallasforge                         # Main package containing all tutorials & shared tooling
 │   ├── __init__.py
@@ -24,23 +25,22 @@ pallasforge/
 │   │   └── utils.py
 │   └── hopper                          # Architecture track (Hopper: H100/H200)
 │       ├── __init__.py
-│       ├── matmul
-│       └── media
+│       ├── kernel_example.py
+│       └── ...
 ├── pyproject.toml
 
 ```
 
-## Tutorials
+## Kernels and Guides
 
-Tutorials are provided as a reference for starters along with educational material to help understand the concepts.
+### Hopper (H100, H200)
 
-1. **Hopper (H100, H200)**
-    - Matrix Multiplication
-        - [Overview and Fundamentals](./pallasforge/hopper/matmul/hopper-wgmma-pipeline.md)
-        - [Basic Matrix Multiplication (BF16 @ BF16)](./pallasforge/hopper/matmul/bf16_matmul.py)
-        - [Quantized Matrix Multiplication (W8 @ A16 with Fused Dequantization)](./pallasforge/hopper/matmul/w8a16.py)
+| Kernel | Code | Guides and Learning Resources |
+| --- | --- | --- |
+| Simple Matmul Kernel (BF16 @ BF16) | [Implementation](./pallasforge/hopper/bf16_matmul.py) | <ul><li><a href="notes/hopper-wgmma-pipeline.md">Tiling, data reuse, and pipelining</a></li></ul> |
+| W8A16 with fused dequantization | [Implementation](./pallasforge/hopper/w8a16.py) | <ul><li><a href="./notes/w8a16.md">W8A16 multiplication (Fused dequantization, pipelining, and split-K)</a></li><li><a href="./notes/benchmark_w8a16.md">Benchmarking and Profiling (Xprof, Nsights)</a></li></ul> |
 
-2. **Blackwell (B100, B200)**
+### Blackwell (B100, B200)
 
 <br><br>
 
@@ -64,13 +64,13 @@ You can then run the given examples like this:
 
 ```shell
 # Run the kernel and check correctness against the reference
-python -m pallasforge.hopper.matmul.bf16_matmul --check 
+python -m pallasforge.hopper.bf16_matmul --check 
 
 # Run the kernel, tune the hyperparameters and benchmark it against the reference
-python -m pallasforge.hopper.matmul.bf16_matmul --tune --benchmark
+python -m pallasforge.hopper.bf16_matmul --tune --benchmark
 
 # Profile the kernel using xprof
-python -m pallasforge.hopper.matmul.bf16_matmul --profile
+python -m pallasforge.hopper.bf16_matmul --profile
 # you can take a look at the kernel stats in traces by running xprof
 xprof <your_trace_dir>
 ```
@@ -90,3 +90,6 @@ If you want to get involved, you can find a list of planned kernels and ideas li
 - [Pallas Mosaic GPU](https://docs.jax.dev/en/latest/pallas/gpu/index.html)
 - [Tokamax](https://github.com/openxla/tokamax)
 - [tune-jax](https://github.com/rdyro/tune-jax)
+
+
+[^feedback]: Feedback is always welcome. If you spot a mistake or find something unclear, please open an issue.
