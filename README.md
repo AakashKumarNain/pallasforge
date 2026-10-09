@@ -31,11 +31,11 @@ pallasforge/
 
 ```
 
-## Kernels and Guides[^1]
+## Kernels and Guides
 
 ### Hopper (H100, H200)
 
-| Kernel | Implementation | Guides and Learning Resources |
+| Kernel | Implementation[^feedback] | Guides and Learning Resources |
 | --- | --- | --- |
 | Simple Matmul Kernel (BF16 @ BF16) | [Code](./pallasforge/hopper/bf16_matmul.py) | <ul><li><a href="notes/hopper-wgmma-pipeline.md">Tiling, data reuse, and pipelining</a></li></ul> |
 | W8A16 with fused dequantization | [Code](./pallasforge/hopper/w8a16.py) | <ul><li><a href="./notes/w8a16.md">W8A16 multiplication (Fused dequantization, pipelining, and split-K)</a></li><li><a href="./notes/benchmark_w8a16.md">Benchmarking and Profiling (Xprof, Nsights)</a></li></ul> |
