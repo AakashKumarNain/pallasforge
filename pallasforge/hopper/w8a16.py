@@ -1,30 +1,3 @@
-"""Fused W8A16 decoding kernels for one Hopper GPU.
-
-Inputs: INT8 weights [N, K], BF16 scales [N], BF16 activations [M, K].
-Output: BF16 [M, N]. Inputs must be finite; N and K must fit the chosen tiles.
-
-Numerical contract: accumulate A @ Q.T in FP32, multiply by each output-channel
-scale in FP32, then round to BF16. This differs from rounding Q * scale to BF16
-before the matrix multiply, as the original implementation did.
-
-All custom kernels use the Mosaic GPU API, including GEMV and split-K reduction.
-The WGMMA path retains wait(0) because delay release when set to 1 is resulting
-in large numerical mismatch for some reason. Split-K stores unscaled FP32 partials
-without transposing the accumulator layout; a second Mosaic kernel reduces and scales.
-Tuning validates each candidate before timing it; a GPU execution error aborts.
-
-Examples:
-    python w8a16_decode.py --check --scenario 0
-     python w8a16_decode.py --tune --tune-method auto --benchmark --scenario 0
-    python w8a16_decode.py --tune --benchmark --configs w8a16_configs.json
-    python w8a16_decode.py --profile --configs w8a16_configs.json
-    MOSAIC_GPU_DUMP_PTXAS=1 python w8a16_decode.py --tune --scenario 0
-
-Reported latency includes host dispatch, synchronization, and every GPU kernel
-in the compiled call. It is not a device-only kernel time or an HBM measurement.
-Use --profile to inspect device execution, padding, reduction, and slicing.
-"""
-
 import argparse
 import json
 import time
@@ -42,8 +15,8 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 import tune_jax
 from tune_jax import tune, tune_logger
 
-from pallasforge.common import benchmark
-from pallasforge.common import format_relative_perf
+from gpu_benchmark import benchmark
+from gpu_benchmark import format_relative_perf
 
 tune_logger.setLevel("INFO")
 
@@ -167,6 +140,7 @@ def reduce_split_k(partials, scale, m, split_k):
             scale_gmem.at[cols], layout=row_layout, optimized=False
         ).astype(jnp.float32)
         result = (result * channel_scale).astype(jnp.bfloat16)
+        # Ref assignment for storing the result
         out_gmem[row, cols] = result
 
     return plgpu.kernel(
@@ -295,7 +269,9 @@ def matmul(
                 result *= jax.lax.broadcast_in_dim(channel_scale, result.shape, (0,))
                 # Retain the working BF16 transpose/store path only for the final output.
                 result = result.astype(jnp.bfloat16)
-                out_smem.T[...] = plgpu.layout_cast(result, plgpu.Layout.WGMMA_TRANSPOSED)  # fmt: off
+                out_smem.T[...] = plgpu.layout_cast(
+                    result, plgpu.Layout.WGMMA_TRANSPOSED
+                )
                 plgpu.commit_smem()
                 rows = pl.ds(row_idx * tile_m, tile_m)
                 cols = pl.ds(col_idx * tile_n, tile_n)
@@ -315,7 +291,6 @@ def matmul(
             plgpu.nd_loop((split_k * output_tiles,), collective_axes="worker")(worker)
         else:
             compute_tile(jax.lax.axis_index("output_tile"))
-
         # Drain all stores before leaving the kernel, after allowing SMEM reuse above.
         if split_k == 1:
             plgpu.wait_smem_to_gmem(0)
@@ -346,9 +321,10 @@ def matmul(
     return reduce_split_k(result, scale, m, split_k)
 
 
+
 def candidate_function(config, num_sms):
     params = dict(config)
-    _ = params.pop("method")
+    method = params.pop("method")
     return partial(matmul, num_sms=num_sms, **params)
 
 
@@ -632,19 +608,18 @@ def tune_for_shape_auto(args, num_sms, warmup=3, iterations=15):
     jax.block_until_ready(tuned(*args))  # first call runs the tuning
     print(tune_jax.tabulate(tuned))
 
-    config = dict(tuned.optimal_hyperparams)
+    config = best = dict(tuned.optimal_hyperparams)
     compiled = compile_candidate(config, num_sms, args)
     # Re-time the winner with CUPTI so the reported number matches metadata["timing"]
-    timing = benchmark_gpu(
-        candidate_function(config, num_sms), args, warmup, max(31, iterations)
-    )
+    timing = benchmark_gpu(candidate_function(config, num_sms), args, warmup, max(31, iterations))
     return config, compiled, timing
+
 
 
 def tune_for_shape_manual(args, cases, num_sms, warmup=3, iterations=15):
     weights, _, activations = args
     m, k = activations.shape
-    configs = enumerate_configs(m, k, weights.shape[0], num_sms)
+    configs = enumerate_configs(m, k, weights.shape[0], num_sms, include_gemv)
     np.random.default_rng(0).shuffle(configs)
     finalists = []
     successes = {}
@@ -658,9 +633,7 @@ def tune_for_shape_manual(args, cases, num_sms, warmup=3, iterations=15):
             continue
         passed, reports = validate(compiled, cases)
         if not passed:
-            print(
-                f"[{index}/{len(configs)}] numerical rejection: {config}: {reports[-1]}"
-            )
+            print(f"[{index}/{len(configs)}] numerical rejection: {config}: {reports[-1]}")
             continue
         path = (config["method"], "split-K" if config["split_k"] > 1 else "direct")
         successes[path] = successes.get(path, 0) + 1
@@ -679,11 +652,11 @@ def tune_for_shape_manual(args, cases, num_sms, warmup=3, iterations=15):
         raise RuntimeError("No candidate compiled and passed all numerical checks.")
     method = "wgmma"
     for mode in ("direct", "split-K"):
-        print(
-            f"Validated {method} {mode} candidates: {successes.get((method, mode), 0)}"
-        )
+        print(f"Validated {method} {mode} candidates: {successes.get((method, mode), 0)}")
 
     # Recheck the top candidates together to reduce ordering and clock-drift effects.
+    # functions = {str(idx): (item[2], args) for idx, item in enumerate(finalists)}
+    # timings = benchmark_calls(functions, warmup, max(31, iterations))
     timings = {
         str(idx): benchmark_gpu(
             candidate_function(item[1], num_sms),
@@ -715,10 +688,12 @@ def read_configs(path, metadata, ignore_stale=False):
     stored = json.loads(path.read_text())
     if stored["environment"] != metadata:
         if ignore_stale:
-            print("Ignoring configurations from an older implementation or env.")
+            print(
+                "Ignoring configurations from an older implementation or environment."
+            )
             return {}
         raise ValueError(
-            "Saved configurations are from a different implementation or env. Run with --tune."
+            "Saved configurations are from a different implementation or environment. Run with --tune."
         )
     return stored["configs"]
 
@@ -845,12 +820,7 @@ def main(argv=None):
                     )
                 else:
                     config, compiled, timing = tune_for_shape_manual(
-                        inputs,
-                        cases,
-                        device.core_count,
-                        args.warmup,
-                        args.tune_iterations,
-                    )
+                        inputs, cases, device.core_count, args.warmup, args.tune_iterations)
 
                 configs[shape_key] = config
                 save_configs(config_path, metadata, configs)
