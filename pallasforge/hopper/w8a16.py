@@ -15,8 +15,8 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 import tune_jax
 from tune_jax import tune, tune_logger
 
-from gpu_benchmark import benchmark
-from gpu_benchmark import format_relative_perf
+from pallasforge.common import benchmark
+from pallasforge.common import format_relative_perf
 
 tune_logger.setLevel("INFO")
 
@@ -321,10 +321,9 @@ def matmul(
     return reduce_split_k(result, scale, m, split_k)
 
 
-
 def candidate_function(config, num_sms):
     params = dict(config)
-    method = params.pop("method")
+    _ = params.pop("method")
     return partial(matmul, num_sms=num_sms, **params)
 
 
@@ -608,18 +607,19 @@ def tune_for_shape_auto(args, num_sms, warmup=3, iterations=15):
     jax.block_until_ready(tuned(*args))  # first call runs the tuning
     print(tune_jax.tabulate(tuned))
 
-    config = best = dict(tuned.optimal_hyperparams)
+    config = dict(tuned.optimal_hyperparams)
     compiled = compile_candidate(config, num_sms, args)
     # Re-time the winner with CUPTI so the reported number matches metadata["timing"]
-    timing = benchmark_gpu(candidate_function(config, num_sms), args, warmup, max(31, iterations))
+    timing = benchmark_gpu(
+        candidate_function(config, num_sms), args, warmup, max(31, iterations)
+    )
     return config, compiled, timing
-
 
 
 def tune_for_shape_manual(args, cases, num_sms, warmup=3, iterations=15):
     weights, _, activations = args
     m, k = activations.shape
-    configs = enumerate_configs(m, k, weights.shape[0], num_sms, include_gemv)
+    configs = enumerate_configs(m, k, weights.shape[0], num_sms)
     np.random.default_rng(0).shuffle(configs)
     finalists = []
     successes = {}
@@ -633,7 +633,9 @@ def tune_for_shape_manual(args, cases, num_sms, warmup=3, iterations=15):
             continue
         passed, reports = validate(compiled, cases)
         if not passed:
-            print(f"[{index}/{len(configs)}] numerical rejection: {config}: {reports[-1]}")
+            print(
+                f"[{index}/{len(configs)}] numerical rejection: {config}: {reports[-1]}"
+            )
             continue
         path = (config["method"], "split-K" if config["split_k"] > 1 else "direct")
         successes[path] = successes.get(path, 0) + 1
@@ -652,7 +654,9 @@ def tune_for_shape_manual(args, cases, num_sms, warmup=3, iterations=15):
         raise RuntimeError("No candidate compiled and passed all numerical checks.")
     method = "wgmma"
     for mode in ("direct", "split-K"):
-        print(f"Validated {method} {mode} candidates: {successes.get((method, mode), 0)}")
+        print(
+            f"Validated {method} {mode} candidates: {successes.get((method, mode), 0)}"
+        )
 
     # Recheck the top candidates together to reduce ordering and clock-drift effects.
     # functions = {str(idx): (item[2], args) for idx, item in enumerate(finalists)}
@@ -820,7 +824,12 @@ def main(argv=None):
                     )
                 else:
                     config, compiled, timing = tune_for_shape_manual(
-                        inputs, cases, device.core_count, args.warmup, args.tune_iterations)
+                        inputs,
+                        cases,
+                        device.core_count,
+                        args.warmup,
+                        args.tune_iterations,
+                    )
 
                 configs[shape_key] = config
                 save_configs(config_path, metadata, configs)

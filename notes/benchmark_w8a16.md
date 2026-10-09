@@ -30,19 +30,19 @@ M can be thought of as the number of tokens in the batch, K is the input width, 
 Always start by checking that the kernel paths are correct:
 
 ```bash
-python -m pallasforge.hopper.w8a16.py --check --scenario 0
+python -m pallasforge.hopper.w8a16 --check --scenario 0
 ```
 
 Then tune and benchmark the workloads you care about. Tuning saves the winning configuration for each shape to the JSON file:
 
 ```bash
-python -m pallasforge.hopper.w8a16.py --tune --benchmark --scenario 0 1 5 6 7 --configs w8a16_configs.json
+python -m pallasforge.hopper.w8a16 --tune --benchmark --scenario 0 1 5 6 7 --configs w8a16_configs.json
 ```
 
 Once the configurations are saved, you can benchmark again without retuning:
 
 ```bash
-python -m pallasforge.hopper.w8a16.py --benchmark --configs w8a16_configs.json
+python -m pallasforge.hopper.w8a16 --benchmark --configs w8a16_configs.json
 ```
 
 Other useful flags:
@@ -116,7 +116,7 @@ XProf shows what runs on the GPU during a call, in order, on a timeline. Use it 
 Capture a trace with the tuned configuration. `--profile` has to run on its own, without `--tune` or `--benchmark`:
 
 ```bash
-python -m pallasforge.hopper.w8a16.py --profile --scenario 0 --configs w8a16_configs.json
+python -m pallasforge.hopper.w8a16 --profile --scenario 0 --configs w8a16_configs.json
 ```
 
 The trace is written to `w8a16_profiles/m1_k4096_n14336`, one folder per workload. View it with:
