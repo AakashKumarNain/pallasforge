@@ -3,9 +3,9 @@ title: "How a Hopper GPU Keeps Matrix Multiplication Moving"
 description: "A visual guide to matrix tiling, cache-friendly traversal, pipelined data movement, and writeback in a Pallas-JAX WGMMA kernel."
 ---
 
-Fast matrix multiplication is not only about doing more math. It is also about keeping data close to the hardware that needs it and moving the next block before the current one is finished.
+Whne you do a matrix multiplication in JAX as $C = AB$, the compiler chooses how to run it on the acceleration (a GPU in our case). You can think of Pallas kernel for the same operation as a function that specifies how the GPU computes the result. You choose how much of each matrix to load at a time, where to store it, and when to load the next part. These choices matter because the GPU can spend time waiting for data even when it has plenty of multiplication work left to do.
 
-This visualization follows one output tile through a Hopper WGMMA kernel written in Pallas. It shows the full path:
+This visualization follows one small part of the output through a Pallas kernel for NVIDIA Hopper GPUs. That part is called a tile. The kernel uses WGMMA, a Hopper operation that multiplies two input tiles and adds their product to a running sum. We will follow four steps:
 - split the matrices into tiles
 - visit those tiles in a cache-friendly order
 - overlap data loading with Tensor Core work, and
@@ -14,54 +14,54 @@ This visualization follows one output tile through a Hopper WGMMA kernel written
 https://github.com/user-attachments/assets/1054424d-a09f-4e0d-b60b-4fbecd2527e3
 
 
-For an interactive video, play [this](../visualizations/simple_matmul.html) in your browser
+To view the interactive video, open [this](../media/bf16_matmul.html) in your browser.
 
-*Note: This visualization was generated using Gemini and may contain minor inaccuracies. Treat it as a conceptual guide rather than an exact account of the implementation.*
+*Note: This visualization was generated using Gemini and may contain minor inaccuracies. Use it to understand the basic ideas; it may not match every detail of the implementation.*
 
 ---
 
 ## 1. Break the problem into tiles
 
-The kernel multiplies a left matrix, `LHS (M × K)`, by a right matrix, `RHS (K × N)`, to produce `Output (M × N)`.
+The left matrix, LHS, has shape $M \times K$. The right matrix, RHS, has shape $K \times N$. Their product has shape $M \times N$. One output value is calculated as $C_{m,n} = \sum_{k=0}^{K-1} A_{m,k} B_{k,n}$, where $A$ is LHS and $B$ is RHS.
 
-These matrices are too large to process at once, so the kernel divides them into smaller tiles. Each worker handles one output tile. It loads a small block from each input, multiplies them, and adds the partial result to a running sum. It repeats this along K until the tile is complete. Tiling gives the hardware a manageable unit of work and lets the kernel keep frequently used data in shared memory and registers. 
+The kernel computes one output tile at a time. It starts with a tile of zeros, loads a block from each input, and adds their product to it. The kernel then moves along the columns of LHS and the matching rows of RHS to get the next pair of blocks. Each pair contributes to the same output tile. The tile is complete only after the kernel has covered all $K$ entries. Computing several output values together also lets the kernel reuse each loaded input value across multiple products. 
 
-In this example, each output tile has 64 rows and 128 columns. One reduction step combines a `64 × 128` LHS tile with a `128 × 128` RHS tile. The 128-wide K dimension is the shared dimension being summed. These sizes also meet the alignment rules used by the Hopper WGMMA path. Here, `tile_m` is a multiple of 64 for Hopper WGMMA, while `tile_n` is a multiple of 8 for Tensor Core alignment. If K is larger than 128, the kernel repeats this work across `K / tile_k` steps and adds every partial result to the same output tile.
+Here, the output tile has shape ($64 \times 128$). Each step multiplies a ($64 \times 128$) LHS tile by a ($128 \times 128$) RHS tile, producing a ($64 \times 128$) partial result. In the code, `tile_m=64` and `tile_n=128` set the output tile size, while `tile_k=128` sets how far each step moves along $K$. If $K=256$, the kernel takes two steps and adds their results. More generally, it takes ($K / \mathrm{tile\_k}$) steps when $K$ is a multiple of `tile_k`. The tile sizes also have to fit the multiplication operation: the Hopper WGMMA path used here requires `tile_m` to be a multiple of 64 and `tile_n` to be a multiple of 8.
 
 ## 2. Visit tiles in a cache-friendly order
 
-After choosing the tile size, we still need to decide which output tile to compute next. That order affects how much input data can be reused from the GPU's L2 cache. A simple row-by-row scan moves left to right, then jumps back to the first column at the start of every new row. That jump can leave behind the RHS data that was just loaded. 
+Two output tiles in the same tile column use the same columns of RHS, even though they use different rows of LHS. Computing them close together in time can avoid another read from the other memory: the RHS data may still be in L2, a cache shared across the GPU. A row-by-row scan works against this at the row boundary. After computing the rightmost tile, it jumps back to the leftmost tile of the next row, which needs a different set of RHS columns. 
 
-A snake path avoids the jump. It moves left to right across one row, then right to left across the next. A persistent worker stays alive on the same SM, and the snake order lets it begin the next row where the last one ended. The RHS columns it just used therefore have a better chance of still being warm in L2.
+The snake order goes left to right across one row of output tiles, then right to left across the next. At the turn, the next output tile needs the same RHS columns as the previous one. This makes it more likely that those values are still in L2. The example also uses persistent workers: each worker computes several output tiles before it finishes, rather than stopping after one. A worker runs on an SM, or streaming multiprocessor, one of the GPU units that executes the kernel. Persistence lets a worker continue taking tiles from the chosen order, but it does not guarantee that the data will stay in cache.
 
-The work is also split into narrow panels. The example uses a panel width of four output columns. This limits the number of RHS columns in play at once, keeps the working set smaller, and improves the odds of cache reuse. Four is not a universal rule; the best width depends on the matrix shape and the hardware.
+The kernel applies this order within narrow panels of output tiles. Each panel in the example is four tile columns wide. Since one output tile is 128 columns wide, a panel covers 512 output columns. Finishing work within that panel keeps the kernel returning to the same group of RHS columns before moving to the next panel. This reduces the amount of RHS data competing for cache space. A width of four is a choice for this example; a different matrix or GPU may work better with another width.
 
 ## 3. Overlap loading with Tensor Core work
 
-Global memory, also called HBM, is large but far from the compute units. If the kernel waits for every load before doing more math, the Tensor Cores sit idle. TMA can move tiles from HBM into shared memory without tying up the main compute path. WGMMA can then run a warp-group matrix multiply-accumulate on data that is already in shared memory.
+The full input matrices live in global memory, also called HBM. Before multiplying a pair of tiles, this kernel copies them into shared memory, or SMEM, a smaller and faster memory available to the threads in a block. The Tensor Cores, which perform the matrix multiplication, read the tiles from there. If every step waits to load its inputs until the previous multiplication finishes, loading and multiplication take turns. The kernel tries to do both at once.
 
-The kernel avoids that wait with a four-stage circular pipeline in shared memory, or SMEM. TMA, Hopper's Tensor Memory Accelerator, moves LHS and RHS tiles from HBM to SMEM without making the main compute path wait for each copy. At the same time, WGMMA runs warp-group matrix multiply-accumulate work on a tile that is already ready.
+TMA, Hopper's Tensor Memory Accelerator, handles the copies into shared memory. A copy is asynchronous: the kernel can start it and do other work while it runs. WGMMA, short for warp-group matrix multiply-accumulate, performs the multiplication and adds the result to the running sum. A warp-group is a group of 128 GPU threads that issue this operation together. Here, both input tiles come from shared memory. Once one pair of tiles is ready, WGMMA can use it while TMA loads a later pair into a different buffer.
 
-To overlap those jobs, the kernel uses a circular pipeline. The example has four shared-memory slots. At any moment, one slot can feed WGMMA, some can hold tiles that are ready, and another can receive a future `K` tile. Once a slot has been consumed, the kernel wraps around and fills it again. Four slots do not promise that every memory delay will disappear, but they can hide much of it when loading and compute are well balanced.
+The four-stage pipeline provides four slots, each with space for one LHS tile and one RHS tile. For example, WGMMA can read the first slot while TMA fills later slots. After the fourth slot, the pipeline returns to the first and reuses it for a later step along $K$. Reuse must wait until WGMMA has finished reading the old tiles, and a multiplication must wait until its input copies are complete. Those waits prevent the two operations from overwriting or reading unfinished data. The extra slots give loading a head start, but the Tensor Cores will still have to wait if the copies fall behind.
 
-Each WGMMA step updates the same (`64 × 128` in this example) accumulator:
+The running sum is called the accumulator. It starts at zero and has the same shape as the output tile, $64 \times 128$ in this example. Each WGMMA step performs this update, where $A_{\mathrm{tile}}$ and $B_{\mathrm{tile}}$ are the current input tiles:
 
-`acc += lhs_smem @ rhs_smem`
+$\mathrm{acc} \leftarrow \mathrm{acc} + A_{\mathrm{tile}} B_{\mathrm{tile}}$
 
-The accumulator stays in registers and uses FP32. That avoids sending partial sums back to memory, and FP32 gives the running total more precision than bfloat16.
+The accumulator stays in registers, the storage used directly by the executing threads. The kernel keeps updating it there instead of writing each partial result back to global memory. It uses FP32, a 32-bit floating-point format, for the sum. FP32 retains more precision than bfloat16, which matters when many partial results are added together.
 
 
 ## 4. Finish, cast and write the tile back
 
-After all K steps are complete, the kernel enters its final stage. It converts the FP32 accumulator to bfloat16, places the result in `out_smem`, and commits that shared-memory data so it is ready to copy.
+Once all steps along $K$ have finished, the accumulator contains the complete output tile. The kernel converts it from FP32 to bfloat16, the 16-bit format used for the output, and places it in the shared-memory buffer `out_smem`. This buffer is the source for the copy back to global memory. Before starting that copy, the kernel commits the shared-memory writes so the copy engine can see the values just written.
 
-That buffer uses `SwizzleTransform(128)`, which lays out the values to reduce shared-memory bank conflicts. The kernel commits the shared-memory writes, starts an asynchronous copy to the correct output slice in HBM, and waits for that copy to finish before it reuses the buffer.
+The buffer uses `SwizzleTransform(128)` to control how its values are arranged in shared memory. Shared memory is divided into banks that can serve accesses in parallel. Some access patterns send multiple requests to the same bank, forcing them to wait. This is a bank conflict. The swizzle rearranges the storage locations to reduce those conflicts without changing the matrix values or their logical positions. The kernel then starts an asynchronous copy from `out_smem` to the tile's position in the output matrix. It waits for the copy to finish before reusing the buffer, so a later tile cannot overwrite values still being copied.
 
 ---
 
 <br>
 
-To sumarize, this is the full pattern:
+The full process is:
 
     - tile the matrices
     - visit the tiles in an order that encourages reuse
